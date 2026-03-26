@@ -62,9 +62,10 @@ CORE_COMPONENTS = [
     'dbus_manager', 'database', 'file_manager', 'authorization',
     'klippy_apis', 'machine', 'data_store', 'shell_command',
     'proc_stats', 'job_state', 'job_queue', 'history',
-    'http_client', 'announcements', 'webcam', 'extensions'
+    'http_client', 'httpx_client', 'announcements', 'webcam', 'extensions'
 ]
-
+FLUIDD_FLAG=".fluidd"
+FACTORY_MODE="/oem/.factory"
 
 class Server:
     error = ServerError
@@ -124,11 +125,16 @@ class Server:
         self.register_endpoint(
             "/server/restart", RequestType.POST, self._handle_server_restart
         )
+        self.register_endpoint(
+            "/server/factory_reset", RequestType.POST, self._handle_server_factory_reset
+        )
+
         self.register_notification("server:klippy_ready")
         self.register_notification("server:klippy_shutdown")
         self.register_notification("server:klippy_disconnect",
                                    "klippy_disconnected")
         self.register_notification("server:gcode_response")
+        self.register_notification("server:factory_reset")
 
     def get_app_args(self) -> Dict[str, Any]:
         return dict(self.app_args)
@@ -307,9 +313,9 @@ class Server:
             component = load_func(config)
         except Exception as e:
             ucomps: List[str] = self.app_args.get("unofficial_components", [])
-            if isinstance(e, ModuleNotFoundError) and component_name not in ucomps:
-                if self.try_pip_recovery(e.name or "unknown"):
-                    return self.load_component(config, component_name, default)
+            # if isinstance(e, ModuleNotFoundError) and component_name not in ucomps:
+            #     if self.try_pip_recovery(e.name or "unknown"):
+            #         return self.load_component(config, component_name, default)
             msg = f"Unable to load component: ({component_name})"
             logging.exception(msg)
             if component_name not in self.failed_components:
@@ -374,10 +380,28 @@ class Server:
     ) -> None:
         self.websocket_manager.register_notification(event_name, notify_name)
 
+    def forward_notification(self, message: bytes) -> None:
+        self.websocket_manager.forward_notification(message)
+
     def register_event_handler(
         self, event: str, callback: FlexCallback
     ) -> None:
         self.events.setdefault(event, []).append(callback)
+
+    def unregister_event_handler(
+        self, event: str, callback: FlexCallback
+    ) -> None:
+        if event not in self.events:
+            logging.info(f'event {event} not registered')
+            return
+        try:
+            self.events[event].remove(callback)
+        except ValueError:
+            logging.info(f'callback {callback} not registered for event {event}')
+            # Callback not registered
+            return
+        if not self.events[event]:
+            del self.events[event]
 
     def send_event(self, event: str, *args) -> asyncio.Future:
         fut = self.event_loop.create_future()
@@ -495,6 +519,15 @@ class Server:
     async def _handle_server_restart(self, web_request: WebRequest) -> str:
         self.event_loop.register_callback(self._stop_server)
         return "ok"
+
+    async def _handle_server_factory_reset(self, web_request: WebRequest) -> str:
+        self.send_event("server:factory_reset")
+        client_mgr = self.lookup_component("client_manager", None)
+        if client_mgr is not None:
+            await client_mgr.handle_factory_reset()
+        return {
+            "state": "success"
+        }
 
     async def _handle_info_request(self, web_request: WebRequest) -> Dict[str, Any]:
         raw = web_request.get_boolean("raw", False)
@@ -686,6 +719,17 @@ def main(from_package: bool = True) -> None:
         "instance_uuid": instance_uuid,
         "unix_socket_path": unix_sock
     }
+
+    fluidd_config_writable = pathlib.Path(data_path).joinpath(FLUIDD_FLAG)
+    # check if device in factory mode
+    if pathlib.Path(FACTORY_MODE).is_file() or fluidd_config_writable.is_file():
+        app_args.update({
+            "config_writable": True,
+        })
+    else:
+        app_args.update({
+            "config_writable": False,
+        })
 
     # Setup Logging
     app_args.update(get_software_info())

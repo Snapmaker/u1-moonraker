@@ -214,6 +214,10 @@ class WebsocketManager:
                 continue
             sc.queue_message(msg)
 
+    def forward_notification(self, message: bytes) -> None:
+        for sc in list(self.clients.values()):
+            sc.queue_message(message)
+
     def get_count(self) -> int:
         return len(self.clients)
 

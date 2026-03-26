@@ -47,6 +47,7 @@ RESERVED_ENDPOINTS = [
     "list_endpoints",
     "gcode/subscribe_output",
     "register_remote_method",
+    "emergency_stop"
 ]
 
 # Items to exclude from the subscription cache.  They never change and can be
@@ -73,6 +74,7 @@ class KlippyConnection:
         self.connection_mutex: asyncio.Lock = asyncio.Lock()
         self.event_loop = self.server.get_event_loop()
         self.log_no_access = True
+        # self._last_state_message: Optional[str] = None
         # Connection State
         self.connection_task: Optional[asyncio.Task] = None
         self.closing: bool = False
@@ -370,6 +372,7 @@ class KlippyConnection:
         self._missing_reqs.clear()
         self.init_attempts = 0
         self._state = KlippyState.STARTUP
+        # self._last_state_message = None
         while self.server.is_running():
             await asyncio.sleep(INIT_TIME)
             await self._check_ready()
@@ -413,6 +416,54 @@ class KlippyConnection:
             logging.info("GCode Output Subscribed")
 
     async def _check_ready(self) -> None:
+        def _parse_coded_string(coded_string: str) -> Optional[Dict[str, int]]:
+            try:
+                parts = coded_string.split('-')
+                if len(parts) != 4:
+                    logging.warning(f"Invalid coded string format: {coded_string}")
+                    return None
+                return {
+                    "level": int(parts[0]),
+                    "id": int(parts[1]),
+                    "index": int(parts[2]),
+                    "code": int(parts[3])
+                }
+            except ValueError as e:
+                logging.exception(f"Failed to parse coded string: {coded_string}")
+                return None
+
+        def _handle_coded_exception(state_msg: str) -> None:
+            if state_message.startswith('{"coded"'):
+                try:
+                    json_start = state_message.find('{')
+                    json_end = state_message.rfind('}') + 1
+                    if json_start != -1 and json_end != -1:
+                        coded_state_message = jsonw.loads(state_message[json_start:json_end])
+                        coded_string = coded_state_message.get("coded", "")
+                        parsed_coded = _parse_coded_string(coded_string)
+                        if parsed_coded is not None:
+                            excep = {
+                                'level': parsed_coded["level"],
+                                'id': parsed_coded["id"],
+                                'index': parsed_coded["index"],
+                                'code': parsed_coded["code"],
+                                'message': coded_state_message.get("msg", ""),
+                                'timestamp': time.time()
+                            }
+                            self.server.send_event("snapmaker:exception_notification", excep)
+                            exception_manager = self.server.lookup_component("exception_manager", None)
+                            if exception_manager is not None:
+                                exception_manager._init_exception_status(
+                                    exception_manager.motion_excep_status, excep['id'], excep['index'], excep['code'])
+                                should_notify = exception_manager._update_exception_cache(
+                                    exception_manager.motion_excep_cache, excep['id'], excep['index'], excep['code'], excep['level'], excep['timestamp'], excep['message'])
+                                if should_notify:
+                                    excep_cache = exception_manager.motion_excep_cache + exception_manager.system_excep_cache
+                                    self.server.send_event("snapmaker:exception_status", {"exceptions": excep_cache})
+                            else:
+                                logging.info("Cannot handle motion exception: exception_manager component unavailable")
+                except Exception:
+                    logging.exception(f"Failed to parse coded state message: {state_message}")
         send_id = not self._klippy_identified
         result: Dict[str, Any]
         try:
@@ -444,6 +495,9 @@ class KlippyConnection:
         state_message: str = self._state.message
         if "state_message" in self._klippy_info:
             state_message = self._klippy_info["state_message"]
+            _handle_coded_exception(state_message)
+            # if state_message != self._last_state_message:
+                # self._last_state_message = state_message
             self._state.set_message(state_message)
         if "state" not in result:
             return
@@ -461,6 +515,7 @@ class KlippyConnection:
             startup_state = self._state
             await self.server.send_event("server:klippy_started", startup_state)
             self._klippy_started = True
+            is_klippy_shutdown = True
             if self._state != KlippyState.READY:
                 logging.info("\n" + self._state.message)
                 if (
@@ -485,11 +540,23 @@ class KlippyConnection:
                     if self._state == KlippyState.SHUTDOWN:
                         # Klippy shutdown during ready event
                         self.server.send_event("server:klippy_shutdown")
+                    else:
+                        is_klippy_shutdown = False
                 else:
                     logging.info(
                         "Klippy state transition from ready during init, "
                         f"new state: {self._state}"
                     )
+
+                if is_klippy_shutdown:
+                    result: Dict[str, Any]
+                    result = await self.klippy_apis.get_klippy_info(send_id)
+                    # klippy_info = dict(result)
+                    # logging.info(f"Klippy Info: {klippy_info}")
+                    self._klippy_info = dict(result)
+                    if "state_message" in self._klippy_info:
+                        state_message = self._klippy_info["state_message"]
+                        _handle_coded_exception(state_message)
             self._klippy_initializing = False
 
     async def _verify_klippy_requirements(self) -> None:
@@ -619,12 +686,13 @@ class KlippyConnection:
     async def _request_subscripton(self, web_request: WebRequest) -> Dict[str, Any]:
         async with self.subscription_lock:
             args = web_request.get_args()
-            conn = web_request.get_subscribable()
+            conn:APITransport = web_request.get_subscribable()
             if conn is None:
                 raise self.server.error(
                     "No connection associated with subscription request"
                 )
             requested_sub: Subscription = args.get('objects', {})
+            self.server.send_event("klippy:new_subscription", requested_sub, conn.transport_type)
             all_subs: Subscription = dict(requested_sub)
             # Build the subscription request from a superset of all client subscriptions
             for sub in self.subscriptions.values():

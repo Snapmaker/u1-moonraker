@@ -351,6 +351,11 @@ class History:
     async def _handle_job_total_reset(
         self, web_request: WebRequest
     ) -> Dict[str, Union[Totals, AuxTotals]]:
+        # for now we will not allow resetting totals
+        return {
+            "last_totals": self.job_totals,
+            "last_auxiliary_totals":  self.aux_totals
+        }
         if self.current_job is not None:
             raise self.server.error("Job in progress, cannot reset totals")
         last_totals = self.job_totals
@@ -605,6 +610,9 @@ class History:
         jstate: JobState = self.server.lookup_component("job_state")
         last_ps = jstate.get_last_stats()
         await self.finish_job("server_exit", last_ps)
+
+    def get_job_totals(self) -> Dict[str, Any]:
+        return self.job_totals
 
 class PrinterJob:
     def __init__(self, data: Dict[str, Any] = {}) -> None:

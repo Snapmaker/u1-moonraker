@@ -147,7 +147,7 @@ def get_software_info() -> Dict[str, Any]:
     if pkg_ver is not None:
         return {"software_version": pkg_ver}
     version: str = "?"
-    vfile = src_path.joinpath("moonraker/.version")
+    vfile = src_path.joinpath("/etc/VERSION")
     if vfile.exists():
         try:
             version = vfile.read_text().strip()

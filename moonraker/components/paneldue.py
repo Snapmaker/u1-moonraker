@@ -340,6 +340,7 @@ class PanelDue:
         self.debug_queue.append(line)
         # If we find M112 in the line then skip verification
         if "M112" in line.upper():
+            logging.info("PanelDue: Emergency Stop Requested")
             self.event_loop.register_callback(self.klippy_apis.emergency_stop)
             return
 

@@ -312,6 +312,7 @@ class AIOHelper:
 
 
 class MQTTClient(APITransport):
+    CLIENT_OFFLINE_TIMEOUT = 60
     def __init__(self, config: ConfigHelper) -> None:
         self.server = config.get_server()
         self.eventloop = self.server.get_event_loop()
@@ -345,6 +346,12 @@ class MQTTClient(APITransport):
             raise config.error(
                 "Option 'instance_name' in section [mqtt] cannot "
                 "contain a wildcard.")
+        dp = self.server.get_app_arg("data_path", None)
+        if dp:
+            sn_path = pathlib.Path(dp).joinpath(".lava.sn")
+            if sn_path.is_file():
+                self.instance_name = sn_path.read_text().strip().upper()
+                logging.info(f"MQTT instance name: {self.instance_name}")
         self.qos = config.getint("default_qos", 0)
         if self.qos > 2 or self.qos < 0:
             raise config.error(
@@ -386,12 +393,21 @@ class MQTTClient(APITransport):
             transports=ep_transports
         )
 
+        self.notification_buf: List[Union[bytes, str]] = []
+        self.queue_busy: bool = False
+        self.last_request_time: float = -1.0
+        self.client_online = False
+
         # Subscribe to API requests
-        self.api_request_topic = f"{self.instance_name}/moonraker/api/request"
-        self.api_resp_topic = f"{self.instance_name}/moonraker/api/response"
-        self.klipper_status_topic = f"{self.instance_name}/klipper/status"
+        self.api_request_topic = f"{self.instance_name}/request"
+        self.api_resp_topic = f"{self.instance_name}/response"
+        self.klipper_status_topic = f"{self.instance_name}/status"
         self.klipper_state_prefix = f"{self.instance_name}/klipper/state"
-        self.moonraker_status_topic = f"{self.instance_name}/moonraker/status"
+        self.moonraker_status_topic = f"{self.instance_name}/notification"
+        self.camera_notification_topic = "camera/notification"
+        self.system_notification_topic = "system/notification"
+        self.internal_request_topic = f"moonraker/request"
+        self.internal_response_topic = f"moonraker/response"
         status_cfg: Dict[str, str] = config.getdict(
             "status_objects", {}, allow_empty_fields=True
         )
@@ -399,24 +415,25 @@ class MQTTClient(APITransport):
         self.status_cache: Dict[str, Dict[str, Any]] = {}
         self.status_update_timer: Optional[FlexTimer] = None
         self.last_status_time = 0.
+        self.last_status_sent_time = 0.
         self.status_objs: Dict[str, Optional[List[str]]] = {}
         for key, val in status_cfg.items():
             if val is not None:
                 self.status_objs[key] = [v.strip() for v in val.split(',') if v.strip()]
             else:
                 self.status_objs[key] = None
-        if status_cfg:
-            logging.debug(f"MQTT: Status Objects Set: {self.status_objs}")
-            self.server.register_event_handler(
-                "server:klippy_started", self._handle_klippy_started
+        logging.info(f"MQTT: Status Objects Set: {self.status_objs}")
+        self.server.register_event_handler(
+            "server:klippy_started", self._handle_klippy_started
+        )
+        self.server.register_event_handler(
+            "server:klippy_disconnect", self._handle_klippy_disconnect
+        )
+        if self.status_interval:
+            self.status_update_timer = self.eventloop.register_timer(
+                self._handle_timed_status_update
             )
-            self.server.register_event_handler(
-                "server:klippy_disconnect", self._handle_klippy_disconnect
-            )
-            if self.status_interval:
-                self.status_update_timer = self.eventloop.register_timer(
-                    self._handle_timed_status_update
-                )
+        self.server.register_event_handler("klippy:new_subscription", self._record_subscription)
 
         self.timestamp_deque: Deque = deque(maxlen=20)
         self.api_qos = config.getint('api_qos', self.qos)
@@ -424,6 +441,13 @@ class MQTTClient(APITransport):
             self.subscribe_topic(self.api_request_topic,
                                  self._process_api_request,
                                  self.api_qos)
+
+        self.subscribe_topic(self.camera_notification_topic,
+                            self._forward_internal_notification,
+                            0)
+        self.subscribe_topic(self.system_notification_topic,
+                            self._forward_internal_notification,
+                            0)
 
         self.server.register_remote_method("publish_mqtt_topic",
                                            self._publish_from_klipper)
@@ -433,6 +457,13 @@ class MQTTClient(APITransport):
             f"API Response: {self.api_resp_topic}\n"
             f"Moonraker Status: {self.moonraker_status_topic}\n"
             f"Klipper Status: {self.klipper_status_topic}")
+
+        self.subscribe_topic(self.internal_request_topic, self._process_internal_request, 0)
+
+    def _record_subscription(self, objects, transport_type) -> None:
+        if transport_type == TransportType.MQTT:
+            self.status_objs = objects
+            logging.debug(f"MQTT subscribe objects: {self.status_objs}")
 
     async def component_init(self) -> None:
         # We must wait for the IOLoop (asyncio event loop) to start
@@ -452,12 +483,14 @@ class MQTTClient(APITransport):
 
     async def _handle_klippy_started(self, state: KlippyState) -> None:
         if self.status_objs:
+            # logging.info("MQTT Subscribing Klippy status: {}".format(self.status_objs))
             kapi: KlippyAPI = self.server.lookup_component("klippy_apis")
-            await kapi.subscribe_from_transport(
+            self.status_cache = await kapi.subscribe_from_transport(
                 self.status_objs, self, default=None,
             )
-            if self.status_update_timer is not None:
-                self.status_update_timer.start(delay=self.status_interval)
+        # start update timer whatever status_objs is none or not
+        if self.status_update_timer is not None:
+            self.status_update_timer.start(delay=self.status_interval)
 
     def _handle_klippy_disconnect(self):
         if self.status_update_timer is not None:
@@ -768,14 +801,27 @@ class MQTTClient(APITransport):
 
     async def _process_api_request(self, payload: bytes) -> None:
         rpc: JsonRPC = self.server.lookup_component("jsonrpc")
+        self.last_request_time = self.eventloop.get_loop_time()
+        if not self.client_online:
+            logging.info("MQTT Client Online!")
+            self.client_online = True
         response = await rpc.dispatch(payload, self)
         if response is not None:
             await self.publish_topic(self.api_resp_topic, response,
                                      self.api_qos)
-
+    async def _process_internal_request(self, payload: bytes) -> None:
+        rpc: JsonRPC = self.server.lookup_component("jsonrpc")
+        response = await rpc.dispatch(payload, self)
+        if response is not None:
+            await self.publish_topic(self.internal_response_topic, response,
+                                     0)
     @property
     def transport_type(self) -> TransportType:
         return TransportType.MQTT
+
+    async def _forward_internal_notification(self, payload: bytes) -> None:
+        self.server.forward_notification(payload)
+        await self.publish_topic(self.moonraker_status_topic, payload, self.qos, retain=False)
 
     def screen_rpc_request(
         self, api_def: APIDefinition, req_type: RequestType, args: Dict[str, Any]
@@ -800,10 +846,20 @@ class MQTTClient(APITransport):
             self.last_status_time = eventtime
 
     def _handle_timed_status_update(self, eventtime: float) -> float:
-        if self.status_cache:
-            payload = self.status_cache
-            self.status_cache = {}
+        if eventtime - self.last_request_time > self.CLIENT_OFFLINE_TIMEOUT or self.last_request_time < 0:
+            # If no further requests are received from peer for more than 3 minutes
+            # won't publish status
+            self.last_status_sent_time = self.last_status_time
+            if self.client_online:
+                self.client_online = False
+                logging.info("MQTT Client Offline!")
+                self.server.send_event("mqtt:client_offline")
+
+        if self.last_status_time != self.last_status_sent_time:
+            payload = self.status_cache.copy()
             self._publish_status_update(payload, self.last_status_time)
+            self.last_status_sent_time = self.last_status_time
+            self.status_cache = {}
         return eventtime + self.status_interval
 
     def _publish_status_update(self, status: Dict[str, Any], eventtime: float) -> None:
@@ -816,9 +872,11 @@ class MQTTClient(APITransport):
                         f"{self.klipper_state_prefix}/{objkey}/{statekey}",
                         payload, retain=True)
         else:
-            payload = {'eventtime': eventtime, 'status': status}
-            self.publish_topic(self.klipper_status_topic, payload)
-
+            # payload = {'eventtime': eventtime, 'status': status}
+            # change status format to matching websocket, for app convenient
+            payload = {'jsonrpc': '2.0', 'method': 'notify_status_update',
+                        'params': [status, eventtime]}
+            self.publish_topic(self.klipper_status_topic, payload, retain=True)
 
     def get_instance_name(self) -> str:
         return self.instance_name
@@ -859,6 +917,67 @@ class MQTTClient(APITransport):
             topic = f"{self.instance_name}/{topic.lstrip('/')}"
         await self.publish_topic(topic, payload, qos, retain)
 
+    async def _publish_notification(self):
+        if not self.is_connected():
+            self.notification_buf = []
+            self.queue_busy = False
+            return
+        while self.notification_buf:
+            msg = self.notification_buf.pop(0)
+            await self.publish_topic(self.moonraker_status_topic,
+                                        msg,
+                                        qos=self.qos,
+                                        retain=False
+                                    )
+        self.queue_busy = False
+
+    def _queue_notification(
+        self,
+        name: str,
+        data: Union[List, Tuple] = [],
+        mask: List[int] = []
+    ) -> None:
+        msg: Dict[str, Any] = {'jsonrpc': "2.0", 'method': "notify_" + name}
+        if data:
+            msg['params'] = data
+        self.notification_buf.append(
+            jsonw.dumps(msg) if isinstance(msg, dict) else msg
+        )
+        if self.queue_busy:
+            return
+        self.queue_busy = True
+        self.eventloop.register_callback(self._publish_notification)
+
+    def register_notification(
+        self,
+        event_name: str,
+        notify_name: Optional[str] = None,
+        event_type: Optional[str] = None
+    ) -> None:
+        if event_name not in self.server.events:
+            logging.warning(f"MQTT: nobody registered event: {event_name}")
+            return
+        if notify_name is None:
+            notify_name = event_name.split(':')[-1]
+        if event_type == "logout":
+            def notify_handler(*args):
+                self._queue_notification(notify_name, args)
+                # self._process_logout(*args)
+        else:
+            def notify_handler(*args):
+                self._queue_notification(notify_name, args)
+        self.server.register_event_handler(event_name, notify_handler)
+
+    def publish_notification(self, notification: str, payload: str):
+        if not self.is_connected():
+            logging.warning("MQTT: Notification not sent, MQTT not connected")
+            return
+        data = {
+            'jsonrpc': '2.0',
+            'method': notification,
+            'params':[payload]
+        }
+        self.publish_topic(self.moonraker_status_topic, data, self.qos)
 
 def load_component(config: ConfigHelper) -> MQTTClient:
     return MQTTClient(config)

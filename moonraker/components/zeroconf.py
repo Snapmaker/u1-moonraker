@@ -15,6 +15,8 @@ from email.utils import formatdate
 from zeroconf import IPVersion
 from zeroconf.asyncio import AsyncServiceInfo, AsyncZeroconf
 from ..common import RequestType, TransportType
+import pathlib
+from .machine import MACHINE_TYPE
 
 from typing import (
     TYPE_CHECKING,
@@ -31,8 +33,10 @@ if TYPE_CHECKING:
     from ..common import WebRequest
     from .application import MoonrakerApp
     from .machine import Machine
+    from .client_manager import ClientManager
 
-ZC_SERVICE_TYPE = "_moonraker._tcp.local."
+ZC_SERVICE_TYPE = "_snapmaker._tcp.local."
+LAN_MQTT_PORT = 1884
 
 class AsyncRunner:
     def __init__(self, ip_version: IPVersion) -> None:
@@ -68,9 +72,9 @@ class ZeroconfRegistrar:
         hi = self.server.get_host_info()
         self.mdns_name = config.get("mdns_hostname", hi["hostname"])
         addr: str = hi["address"]
-        self.ip_version = IPVersion.All
+        self.ip_version = IPVersion.V4Only
         if addr.lower() == "all":
-            addr = "::"
+            addr = "0.0.0.0"
         else:
             addr_obj = ipaddress.ip_address(addr)
             self.ip_version = (
@@ -85,11 +89,14 @@ class ZeroconfRegistrar:
         self.ssdp_server: Optional[SSDPServer] = None
         if config.getboolean("enable_ssdp", False):
             self.ssdp_server = SSDPServer(config)
-
+        self.server.register_endpoint("/server/discovery/disable",
+                                        RequestType.POST,
+                                        self._disable)
     async def component_init(self) -> None:
         logging.info("Starting Zeroconf services")
         app: MoonrakerApp = self.server.lookup_component("application")
         machine: Machine = self.server.lookup_component("machine")
+        client_mgr: ClientManager = self.server.lookup_component("client_manager")
         app_args = self.server.get_app_args()
         instance_uuid: str = app_args["instance_uuid"]
         if (
@@ -102,32 +109,63 @@ class ZeroconfRegistrar:
             # Use the UUID.  First 8 hex digits should be unique enough
             instance_name = f"Moonraker-{instance_uuid[:8]}"
         hi = self.server.get_host_info()
+        device_name = machine.get_device_name()
+        instance_name = machine.get_product_sn()
         host = self.mdns_name
-        zc_service_props = {
-            "uuid": instance_uuid,
-            "https_port": hi["ssl_port"] if app.https_enabled() else "",
-            "version": app_args["software_version"],
-            "route_prefix": app.route_prefix
-        }
+        if client_mgr is None:
+            logging.error("No access code found.  Please check your configuration.")
+            link_mode = 0
+            userid = ""
+            region = ""
+        else:
+            link_mode = client_mgr.get_link_mode()
+            userid = client_mgr.get_userid()
+            region = client_mgr.get_region()
+
         if self.bound_all:
             if not host:
                 host = machine.public_ip
             network = machine.get_system_info()["network"]
-            addresses: List[bytes] = [x for x in self._extract_ip_addresses(network)]
+            self.addresses: List[bytes] = [x for x in self._extract_ip_addresses(network)]
         else:
             if not host:
                 host = self.cfg_addr
             host_addr = ipaddress.ip_address(self.cfg_addr)
-            addresses = [host_addr.packed]
-        zc_service_name = f"{instance_name} @ {host}.{ZC_SERVICE_TYPE}"
+            self.addresses = [host_addr.packed]
+        ip_addr = None
+        for addr_bytes in self.addresses:
+            try:
+                ip_addr = ipaddress.ip_address(addr_bytes)
+                if (
+                    (self.ip_version == IPVersion.V4Only and ip_addr.version == 6) or
+                    (self.ip_version == IPVersion.V6Only and ip_addr.version == 4)
+                ):
+                    raise ValueError("IP version mismatch")
+            except ValueError:
+                logging.error(f"Invalid IP address: {addr_bytes}")
+                continue
+
+        self.zc_service_props = {
+            "version": app_args["software_version"],
+            "machine_type": MACHINE_TYPE,
+            "device_name": device_name,
+            "sn": instance_name,
+            "link_mode": "lan" if link_mode > 0 else "wan",
+            "userid": userid,
+            "ip": str(ip_addr) if ip_addr else "",
+            "region": region
+        }
+        logging.info(f"Zeroconf props: {self.zc_service_props}")
+
+        self.zc_service_name = f"{self.mdns_name}.{ZC_SERVICE_TYPE}"
         server_name = self.mdns_name or instance_name.lower()
         self.service_info = AsyncServiceInfo(
             ZC_SERVICE_TYPE,
-            zc_service_name,
-            addresses=addresses,
-            port=hi["port"],
-            properties=zc_service_props,
-            server=f"{server_name}.local.",
+            self.zc_service_name,
+            addresses=self.addresses,
+            port=LAN_MQTT_PORT,
+            properties=self.zc_service_props,
+            server=f"U1-{instance_name}.local.",
         )
         await self.runner.register_services([self.service_info])
         if self.ssdp_server is not None:
@@ -139,6 +177,32 @@ class ZeroconfRegistrar:
                 name = instance_name
             await self.ssdp_server.start()
             self.ssdp_server.register_service(name, addr, hi["port"])
+        self.server.register_event_handler("snapmaker:update_mdns_info", self._update_properties)
+
+    async def _update_properties(self, properties: dict) -> None:
+        need_update = False
+        for k,v in properties.items():
+            if k in self.zc_service_props:
+                if self.zc_service_props[k] != v:
+                    self.zc_service_props[k] = v
+                    need_update = True
+            else:
+                self.zc_service_props[k] = v
+                need_update = True
+
+        if need_update:
+            if self.bound_all:
+                logging.info('update zc service: {}'.format(self.zc_service_props))
+                await self.runner.unregister_services([self.service_info])
+                self.service_info = AsyncServiceInfo(
+                    ZC_SERVICE_TYPE,
+                    self.zc_service_name,
+                    addresses=self.addresses,
+                    port=LAN_MQTT_PORT,
+                    properties=self.zc_service_props,
+                    server=f"U1-{self.zc_service_props['sn']}.local.",
+                )
+                await self.runner.register_services([self.service_info])
 
     async def close(self) -> None:
         await self.runner.unregister_services([self.service_info])
@@ -147,9 +211,25 @@ class ZeroconfRegistrar:
 
     async def _update_service(self, network: Dict[str, Any]) -> None:
         if self.bound_all:
+            await self.runner.unregister_services([self.service_info])
             addresses = [x for x in self._extract_ip_addresses(network)]
+            for addr_bytes in addresses:
+                try:
+                    ip_addr = ipaddress.ip_address(addr_bytes)
+                    self.zc_service_props["ip"] = str(ip_addr)
+                except ValueError:
+                    pass
             self.service_info.addresses = addresses
-            await self.runner.update_services([self.service_info])
+            self.service_info = AsyncServiceInfo(
+                    ZC_SERVICE_TYPE,
+                    self.zc_service_name,
+                    addresses=self.addresses,
+                    port=LAN_MQTT_PORT,
+                    properties=self.zc_service_props,
+                    server=f"U1-{self.zc_service_props['sn']}.local.",
+            )
+            logging.info("update zeroconf, new props:{}".format(self.zc_service_props))
+            await self.runner.register_services([self.service_info])
 
     def _extract_ip_addresses(self, network: Dict[str, Any]) -> Iterator[bytes]:
         for ifname, ifinfo in network.items():
@@ -165,6 +245,11 @@ class ZeroconfRegistrar:
                     continue
                 yield addr_obj.packed
 
+    async def _disable(
+        self, web_request: WebRequest
+    ) -> Dict[str, Any]:
+        await self.close()
+        return {"state": "success"}
 
 SSDP_ADDR = ("239.255.255.250", 1900)
 SSDP_SERVER_ID = "Moonraker SSDP/UPNP Server"

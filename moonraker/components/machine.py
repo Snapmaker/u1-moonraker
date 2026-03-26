@@ -20,6 +20,7 @@ import distro
 import tempfile
 import getpass
 import configparser
+import json
 from ..confighelper import FileSourceWrapper
 from ..utils import source_info, cansocket, sysfs_devs, load_system_module
 from ..utils import json_wrapper as jsonw
@@ -75,6 +76,9 @@ SERVICE_PROPERTIES = [
 ]
 USB_IDS_URL = "http://www.linux-usb.org/usb.ids"
 
+MACHINE_TYPE= "Snapmaker U1"
+PRODUCT_INFO_PATH="config/snapmaker/product_info.json"
+
 class Machine:
     def __init__(self, config: ConfigHelper) -> None:
         self.server = config.get_server()
@@ -94,11 +98,15 @@ class Machine:
         if sudo_template is not None:
             self._sudo_password = sudo_template.render()
         self._public_ip = ""
+        app_args = self.server.get_app_args()
+        datapath: pathlib.Path = pathlib.Path(app_args["data_path"])
+        self.product_info_path = datapath.joinpath(PRODUCT_INFO_PATH)
         self.system_info: Dict[str, Any] = {
             'python': {
                 "version": tuple(sys.version_info),
                 "version_string": sys.version.replace("\n", " ")
             },
+            'product_info': self._get_product_info(),
             'cpu_info': self._get_cpu_info(),
             'sd_info': self._get_sdcard_info(),
             'distribution': dist_info,
@@ -159,7 +167,9 @@ class Machine:
         self.server.register_endpoint(
             "/machine/peripherals/video", RequestType.GET, self._handle_video_request
         )
-
+        self.server.register_endpoint(
+            "/machine/set_device_name", RequestType.POST, self._handle_set_device_name
+        )
         self.server.register_notification("machine:service_state_changed")
         self.server.register_notification("machine:sudo_alert")
 
@@ -179,6 +189,17 @@ class Machine:
         self.iwgetid_cmd = shell_cmd.build_shell_command(iwgetbin)
         self.init_evt = asyncio.Event()
         self.libcam = self._try_import_libcamera()
+
+        self.server.register_event_handler(
+            "server:klippy_ready", self._show_product_info)
+        self.server.register_event_handler(
+            "server:klippy_shutdown", self._show_product_info)
+
+    async def _show_product_info(self):
+        # show product info on klippy startup
+        kapis = self.server.lookup_component('klippy_apis')
+        info = jsonw.dumps(self.product_info)
+        await kapis.run_gcode(f"M118 {info}")
 
     def _init_allowed_services(self) -> None:
         app_args = self.server.get_app_args()
@@ -523,7 +544,14 @@ class Machine:
                 encoding="ascii", errors="ignore")
             sd_info['product_revision'] = \
                 f"{int(cid_text[16], 16)}.{int(cid_text[17], 16)}"
-            sd_info['serial_number'] = cid_text[18:26]
+            app_args = self.server.get_app_args()
+            data_path = app_args["data_path"]
+            sn_path = pathlib.Path(data_path).joinpath(".lava.sn")
+            if sn_path.exists():
+                sn = sn_path.read_text().strip()
+                sd_info['serial_number'] = sn.upper()
+            else:
+                sd_info['serial_number'] = cid_text[18:26]
             mfg_year = int(cid_text[27:29], 16) + 2000
             mfg_month = int(cid_text[29], 16)
             sd_info['manufacturer_date'] = f"{mfg_month}/{mfg_year}"
@@ -928,6 +956,109 @@ class Machine:
                 libcam_devs.append(device)
         return libcam_devs
 
+    def _get_product_info(self) -> Dict[str, Any]:
+        product_info_default = {
+            "machine_type": MACHINE_TYPE,
+            "nozzle_diameter": [0.4, 0.4, 0.4, 0.4],
+            "serial_number": "",
+            "device_name": ""
+        }
+        app_args = self.server.get_app_args()
+        data_path = app_args["data_path"]
+
+        if not os.path.exists(self.product_info_path):
+            # create product info file with default values
+            logging.warning(
+                "Product info file not found, creating with default values"
+            )
+            self.product_info = product_info_default
+            try:
+                name_path = pathlib.Path(data_path).joinpath(".device_name")
+                if name_path.exists():
+                    logging.info(f"recover device name from {name_path}")
+                    device_name = name_path.read_text().strip()
+                    if len(device_name) > 0:
+                        self.product_info["device_name"] = device_name
+                else:
+                    logging.info("No device name file found, using default value")
+            except Exception as e:
+                logging.error(f"Failed to read device name: {e}")
+            self.product_info_path.write_text(json.dumps(self.product_info, indent='\t'))
+        else:
+            try:
+                self.product_info = json.loads(self.product_info_path.read_text())
+            except json.JSONDecodeError:
+                logging.error(
+                    "Failed to read product info file, using default values"
+                )
+                self.product_info_path.write_text(json.dumps(product_info_default, indent='\t'))
+                self.product_info = product_info_default
+        # for now, firmware_version and software_version are same
+        self.product_info["firmware_version"] = app_args.get("software_version", "0.0.0")
+        self.product_info["software_version"] = app_args.get("software_version", "0.0.0")
+
+        need_saved = False
+        # check if product_info contains required fields in product_info_default
+        for key in product_info_default:
+            if key not in self.product_info:
+                logging.warning(
+                    f"Missing key '{key}' in product info, using default value"
+                )
+                self.product_info[key] = product_info_default[key]
+                need_saved = True
+
+        try:
+            sn_path = pathlib.Path(data_path).joinpath(".lava.sn")
+            logging.info(f"Reading product info from {sn_path}")
+            if sn_path.exists():
+                sn = sn_path.read_text().strip()
+                if sn != self.product_info.get("serial_number", ""):
+                    self.product_info["serial_number"] = sn.upper()
+                    need_saved = True
+            else:
+                logging.error("No serial number file found, using default value")
+
+            if len(self.product_info['device_name']) == 0:
+                self.product_info["device_name"] = MACHINE_TYPE
+                need_saved = True
+        except Exception as e:
+            logging.error(f"fail to read product info: {e}")
+
+        logging.info(f'product info: {self.product_info}')
+        if need_saved:
+            try:
+                self.product_info_path.write_text(json.dumps(self.product_info, indent='\t'))
+            except Exception as e:
+                logging.error(f"Failed to save product info: {e}")
+        return self.product_info
+
+    async def _handle_set_device_name(self,
+                                      web_request: WebRequest
+                                      ) -> Dict[str, Any]:
+        name = web_request.get_str("name", MACHINE_TYPE)
+        if not name:
+            logging.error("No device name provided")
+            return {
+                "state": "error",
+                "message": "No device name provided"
+            }
+        if len(name) > 32:
+            name = name[:32]
+        self.product_info["device_name"] = name
+        self.system_info["product_info"] = self.product_info
+        self.server.send_event("snapmaker:update_mdns_info", {'device_name': name})
+        self.server.send_event("smcloud:devie_info_update", {'device_name': name})
+        self.product_info_path.write_text(json.dumps(self.product_info, indent='\t'))
+        logging.info(f'Device name set to {name}')
+        return {
+            "state": "success"
+        }
+
+    def get_device_name(self) -> str:
+        return self.product_info.get("device_name", MACHINE_TYPE)
+
+    def get_product_sn(self) -> str:
+        return self.product_info.get("serial_number", "")
 
 class BaseProvider:
     def __init__(self, config: ConfigHelper) -> None:

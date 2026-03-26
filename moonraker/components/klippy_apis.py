@@ -7,7 +7,7 @@
 from __future__ import annotations
 import logging
 from ..utils import Sentinel
-from ..common import WebRequest, APITransport, RequestType
+from ..common import WebRequest, APITransport, RequestType, TransportType, KlippyState
 
 # Annotation imports
 from typing import (
@@ -71,6 +71,48 @@ class KlippyAPI(APITransport):
         self.server.register_endpoint(
             "/printer/firmware_restart", RequestType.POST, self._gcode_firmware_restart
         )
+        self.server.register_endpoint(
+            "/printer/emergency_stop",
+            RequestType.POST,
+            self._emergency_stop,
+            transports=(TransportType.all() & ~TransportType.HTTP)
+        )
+        self.server.register_endpoint(
+            "/printer/control/led",
+            RequestType.POST,
+            self._control_led,
+            transports=(TransportType.all() & ~TransportType.HTTP)
+        )
+        self.server.register_endpoint(
+            "/printer/control/main_fan",
+            RequestType.POST,
+            self._control_main_fan,
+            transports=(TransportType.all() & ~TransportType.HTTP)
+        )
+        self.server.register_endpoint(
+            "/printer/control/generic_fan",
+            RequestType.POST,
+            self._control_generic_fan,
+            transports=(TransportType.all() & ~TransportType.HTTP)
+        )
+        self.server.register_endpoint(
+            "/printer/control/extruder_temp",
+            RequestType.POST,
+            self._control_extruder_temp,
+            transports=(TransportType.all() & ~TransportType.HTTP)
+        )
+        self.server.register_endpoint(
+            "/printer/control/bed_temp",
+            RequestType.POST,
+            self._control_bed_temp,
+            transports=(TransportType.all() & ~TransportType.HTTP)
+        )
+        self.server.register_endpoint(
+            "/printer/control/print_speed",
+            RequestType.POST,
+            self._control_print_speed,
+            transports=(TransportType.all() & ~TransportType.HTTP)
+        )
         self.server.register_event_handler(
             "server:klippy_disconnect", self._on_klippy_disconnect
         )
@@ -89,8 +131,16 @@ class KlippyAPI(APITransport):
         return await self.cancel_print()
 
     async def _gcode_start_print(self, web_request: WebRequest) -> str:
+        if not await self._check_can_print():
+            return {
+                "state": "error",
+                "message": "Printer is not ready to start a new print job."
+            }
         filename: str = web_request.get_str('filename')
         user = web_request.get_current_user()
+        transport = web_request.get_client_connection()
+        ip = transport.ip_addr if transport else None
+        logging.info(f"Starting print from: {ip if ip else web_request.get_ip_address()}")
         return await self.start_print(filename, user=user)
 
     async def _gcode_restart(self, web_request: WebRequest) -> str:
@@ -98,6 +148,24 @@ class KlippyAPI(APITransport):
 
     async def _gcode_firmware_restart(self, web_request: WebRequest) -> str:
         return await self.do_restart("FIRMWARE_RESTART")
+
+    async def _check_can_print(self) -> bool:
+        if self.klippy.state != KlippyState.READY:
+            return False
+        try:
+            result = await self.query_objects({"print_stats": None})
+        except Exception:
+            # Klippy not connected
+            logging.error("Failed to query print_stats from klippy")
+            return False
+        if 'print_stats' not in result:
+            logging.error("No print_stats in klippy response")
+            return False
+        state: str = result['print_stats']['state']
+        if state in ["printing", "paused"]:
+            logging.warning("Printer is busy, cannot start new print")
+            return False
+        return True
 
     async def _send_klippy_request(
         self,
@@ -114,6 +182,96 @@ class KlippyAPI(APITransport):
                 raise
             result = default
         return result
+
+    async def _emergency_stop(self,
+                            web_request: WebRequest
+                        ) -> Dict[str, Any]:
+        sc = web_request.get_client_connection()
+        params = web_request.get_args()
+        logging.info(f"Emergency Stop, conn uid: {sc.uid}, type: {sc.transport_type}, params: {params}")
+        return await self._send_klippy_request(
+            "emergency_stop", params, Sentinel.MISSING)
+    async def _control_led(self,
+                        web_request: WebRequest
+                        ) -> Dict[str, Any]:
+        name: str = web_request.get_str('name')
+        red: int = web_request.get_int('red', 0)
+        green: int = web_request.get_int('green', 0)
+        blue: int = web_request.get_int('blue', 0)
+        white: int = web_request.get_int('white', 0)
+        transmit: int = web_request.get_int('transmit', 1)
+        index: int = web_request.get_int('transmit', None)
+        sync: int = web_request.get_int('sync', 1)
+        params = {
+            'led': name,
+            'red': red,
+            'green': green,
+            'blue': blue,
+            'white': white,
+            'transmit': transmit,
+            'SYNC': sync
+        }
+        if index != None:
+            params['index'] = index
+        return await self._send_klippy_request(
+            "control/led", params, Sentinel.MISSING)
+
+    async def _control_main_fan(self,
+                        web_request: WebRequest
+                        ) -> Dict[str, Any]:
+        speed: int = web_request.get_int('speed', 0)
+        params = {
+            'S': speed,
+        }
+        return await self._send_klippy_request(
+            "control/main_fan", params, Sentinel.MISSING)
+
+    async def _control_generic_fan(self,
+                        web_request: WebRequest
+                        ) -> Dict[str, Any]:
+        name: str = web_request.get_str('name')
+        speed: int = web_request.get_int('speed', 0)
+        params = {
+            'fan': name,
+            'S': speed
+        }
+        return await self._send_klippy_request(
+            "control/generic_fan", params, Sentinel.MISSING)
+
+    async def _control_extruder_temp(self,
+                        web_request: WebRequest
+                        ) -> Dict[str, Any]:
+        temp: int = web_request.get_int('temp', 0)
+        index: int = web_request.get_int('index', None)
+        map_num: int = web_request.get_int('map', 1)
+        params = {
+            'S': temp,
+            'A': map_num
+        }
+        if index != None:
+            params['T'] = index
+        return await self._send_klippy_request(
+            "control/extruder_temp", params, Sentinel.MISSING)
+
+    async def _control_bed_temp(self,
+                        web_request: WebRequest
+                        ) -> Dict[str, Any]:
+        temp: int = web_request.get_int('temp', 0)
+        params = {
+            'S': temp
+        }
+        return await self._send_klippy_request(
+            "control/bed_temp", params, Sentinel.MISSING)
+
+    async def _control_print_speed(self,
+                        web_request: WebRequest
+                        ) -> Dict[str, Any]:
+        percentage: int = web_request.get_int('percentage', 0)
+        params = {
+            'S': percentage
+        }
+        return await self._send_klippy_request(
+            "control/print_speed", params, Sentinel.MISSING)
 
     async def run_gcode(self,
                         script: str,

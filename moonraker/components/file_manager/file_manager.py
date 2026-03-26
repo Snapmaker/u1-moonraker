@@ -54,12 +54,24 @@ if TYPE_CHECKING:
     StrOrPath = Union[str, pathlib.Path]
     _T = TypeVar("_T")
 
-VALID_GCODE_EXTS = ['.gcode', '.g', '.gco', '.ufp', '.nc']
+VALID_GCODE_EXTS = ['.gcode', '.g', '.gco', '.ufp']
 METADATA_SCRIPT = os.path.abspath(os.path.join(
     os.path.dirname(__file__), "metadata.py"))
 WATCH_FLAGS = iFlags.CREATE | iFlags.DELETE | iFlags.MODIFY \
     | iFlags.MOVED_TO | iFlags.MOVED_FROM | iFlags.ONLYDIR \
     | iFlags.CLOSE_WRITE
+
+# 1400MB reserved for other functions
+# user still has announced space after reserved
+RESERVED_USER_SPACE = 1400 * 1024 * 1024
+OEM_SPACE = 100 * 1024 * 1024
+USER_DATA_PATH = "/userdata"
+USB_MOUNT_PARENT="/mnt"
+USB_MOUNT_POINT="/mnt/udisk"
+USB_GCODE_DIR=".udisk"
+BUILT_IN_GCODE_DIR="/home/lava/origin_printer_data/builtin_gcodes"
+FACTORY_RESET_FLAG=".factory_reset"
+TMP_GCODE_DIR = "/userdata/.tmp_gcodes"
 
 class FileManager:
     def __init__(self, config: ConfigHelper) -> None:
@@ -104,6 +116,11 @@ class FileManager:
         self.queue_gcodes: bool = config.getboolean('queue_gcode_uploads', False)
         self.check_klipper_path = config.getboolean("check_klipper_config_path", True)
 
+        # Track USB mount points for re-scanning
+        self.usb_mount_paths: Set[str] = set()
+        self.mount_check_interval: float = config.getfloat("usb_mount_check_interval", 1.0)
+        self.usb_scan_lock = asyncio.Lock()
+
         # Register file management endpoints
         self.server.register_endpoint(
             "/server/files/list", RequestType.GET, self._handle_filelist_request
@@ -135,7 +152,10 @@ class FileManager:
         )
         self.server.register_endpoint(
             "/server/files/delete_file", RequestType.DELETE, self._handle_file_delete,
-            transports=TransportType.WEBSOCKET
+            transports=(TransportType.all() & ~TransportType.HTTP)
+        )
+        self.server.register_endpoint(
+            "/server/files/usb_rescan", RequestType.POST, self._handle_usb_rescan
         )
         # register client notificaitons
         self.server.register_notification("file_manager:filelist_changed")
@@ -143,12 +163,15 @@ class FileManager:
         self.server.register_event_handler(
             "server:klippy_identified", self._update_fixed_paths)
 
+        self.server.register_event_handler(
+            "server:factory_reset", self._handle_factory_reset)
+
         # Register Data Folders
         secrets: Secrets = self.server.load_component(config, "secrets")
         self.add_reserved_path("secrets", secrets.get_secrets_file(), False)
 
         config.get('config_path', None, deprecate=True)
-        cfg_writeble = config.getboolean("enable_config_write_access", True)
+        cfg_writeble = app_args.get("config_writable", False)
         self.register_data_folder("config", full_access=cfg_writeble)
 
         config.get('log_path', None, deprecate=True)
@@ -175,7 +198,41 @@ class FileManager:
                 self.gcode_metadata.prune_storage()
 
     async def component_init(self):
+        # if .factory_reset in gcode root exists, remove directory .thumbs in gcode root
+        gcodes_path = self.file_paths.get("gcodes")
+        if gcodes_path:
+            gcodes_path = pathlib.Path(gcodes_path)
+            fact_reset_flag = gcodes_path / FACTORY_RESET_FLAG
+            if fact_reset_flag.exists():
+                logging.info("Factory Reset detected, extracting built-in gcodes")
+                # copy built-in gcodes in /home/lava/origin_printer_data/built-in gcodes to gcode root
+                built_in_gcodes_path = pathlib.Path(BUILT_IN_GCODE_DIR)
+                if built_in_gcodes_path.exists() and built_in_gcodes_path.is_dir():
+                    for item in built_in_gcodes_path.iterdir():
+                        dest = gcodes_path / item.name
+                        if item.is_dir():
+                            logging.info(f"extracting gcode dir {item.name}")
+                            if not dest.exists():
+                                shutil.copytree(item, dest)
+                        elif item.is_file():
+                            logging.info(f"extracting file {item.name}")
+                            if not dest.exists():
+                                shutil.copy2(item, dest)
+                # remove the .factory_reset
+                fact_reset_flag.unlink()
+
         self.fs_observer.initialize()
+        # Start monitoring USB mount points
+        if "gcodes" in self.file_paths:
+            await self._start_usb_mount_monitoring()
+
+    async def _handle_factory_reset(self) -> None:
+        # create file .factory_reset to flag factory reset in gcode root
+        gcodes_path = self.file_paths.get("gcodes")
+        if gcodes_path:
+            gcodes_path = pathlib.Path(gcodes_path)
+            fact_reset_flag = gcodes_path / FACTORY_RESET_FLAG
+            fact_reset_flag.touch(exist_ok=True)
 
     def _update_fixed_paths(self) -> None:
         kinfo = self.server.get_klippy_info()
@@ -195,10 +252,6 @@ class FileManager:
         if klipper_path is not None:
             self.reserved_paths.pop("klipper", None)
             self.add_reserved_path("klipper", klipper_path)
-            example_cfg_path = os.path.join(klipper_path, "config")
-            self.register_directory("config_examples", example_cfg_path)
-            docs_path = os.path.join(klipper_path, "docs")
-            self.register_directory("docs", docs_path)
 
         # Register log path
         log_file = paths.get('log_file')
@@ -477,7 +530,7 @@ class FileManager:
             relpath: Optional[str] = info.pop("relative_path", None)
             if relpath is None:
                 continue
-            thumbpath = pathlib.Path(requested_file).parent.joinpath(relpath)
+            thumbpath = pathlib.Path(".thumbs").joinpath(relpath.split("/", 1)[-1] if "/" in relpath else relpath)
             info["thumbnail_path"] = str(thumbpath)
         return thumblist
 
@@ -762,8 +815,22 @@ class FileManager:
                         rel_path, {})
                     path_info.update(metadata)
                 flist['files'].append(path_info)
-        usage = shutil.disk_usage(path)
-        flist['disk_usage'] = usage._asdict()
+        if root == "gcodes" or root == "camera":
+            free, total = self.get_user_space()
+            used = total - free
+            disk_usage = {
+                'free': free,
+                'total': total,
+                'used': used
+            }
+            flist['disk_usage'] = disk_usage
+        else:
+            disk_usage = {
+                'free': 0,
+                'total': OEM_SPACE,
+                'used': OEM_SPACE
+            }
+        flist['disk_usage'] = disk_usage
         flist['root_info'] = {
             'name': root,
             'permissions': "rw" if root in self.full_access_roots else "r"
@@ -806,8 +873,50 @@ class FileManager:
     def gen_temp_upload_path(self) -> str:
         loop_time = int(self.event_loop.get_loop_time())
         return os.path.join(
-            tempfile.gettempdir(),
+            TMP_GCODE_DIR,
             f"moonraker.upload-{loop_time}.mru")
+
+    def get_user_space(self) -> Any:
+        """Get the total & free space in MiB for the given path."""
+        try:
+            statvfs = os.statvfs(USER_DATA_PATH)
+            free_space = statvfs.f_frsize * statvfs.f_bavail
+            total_space = statvfs.f_frsize * statvfs.f_blocks
+
+            total_space -= RESERVED_USER_SPACE
+            free_space -= RESERVED_USER_SPACE
+            if total_space < 0:
+                total_space = 0
+                free_space  = 0
+            if free_space < 0:
+                free_space = 0
+            return free_space, total_space
+        except Exception as e:
+            logging.error(f"Failed to get free space for {USER_DATA_PATH}: {e}")
+            return 0, 0
+
+    def check_gcodes_space(self, required_space: int) -> bool:
+        """
+        Check if there is enough disk space for the file.
+        Uses SnapmakerCloud's _get_user_space method if available.
+        """
+        # Try to use SnapmakerCloud's space checking if available
+        try:
+            # Get available space in bytes
+            free_space, _ = self.get_user_space()
+            if free_space < 10 * 1024 * 1024:  # Less than 10MiB
+                logging.error("Insufficient disk space: less than 10MiB available")
+                return False
+
+            # Check if we have enough space with buffer 10MiB
+            if required_space + 10 * 1024 * 1024 > free_space:
+                logging.error(f"Insufficient disk space: file size {required_space} > available space {free_space}")
+                return False
+        except Exception as e:
+            logging.warning(f"Failed to check user space: {e}")
+            # Fall back to standard disk usage check
+            return False
+        return True
 
     async def finalize_upload(self,
                               form_args: Dict[str, Any]
@@ -971,7 +1080,8 @@ class FileManager:
 
     def get_file_list(self,
                       root: str,
-                      list_format: bool = False
+                      list_format: bool = False,
+                      storage_type: str = 'all'
                       ) -> Union[Dict[str, Any], List[Dict[str, Any]]]:
         # Use os.walk find files in sd path and subdirs
         filelist: Dict[str, Any] = {}
@@ -1005,12 +1115,19 @@ class FileManager:
                 full_path = os.path.join(dir_path, name)
                 if not os.path.exists(full_path):
                     continue
+                # Check storage type filter
+                is_usb = USB_GCODE_DIR in full_path
+                if storage_type == 'local' and is_usb:
+                    continue
+                elif storage_type == 'usb' and not is_usb:
+                    continue
+                # storage_type == 'all' includes everything
                 fname = full_path[len(path) + 1:]
                 finfo = self.get_path_info(full_path, root)
                 filelist[fname] = finfo
         if list_format:
             flist: List[Dict[str, Any]] = []
-            for fname in sorted(filelist, key=str.lower):
+            for fname in sorted(filelist, key=lambda x: filelist[x]['modified'], reverse=True):
                 fdict: Dict[str, Any] = {'path': fname}
                 fdict.update(filelist[fname])
                 flist.append(fdict)
@@ -1066,6 +1183,27 @@ class FileManager:
                                   ) -> Dict[str, Any]:
         file_path: str = web_request.get_str("path")
         return await self.delete_file(file_path)
+
+    async def _handle_usb_rescan(self,
+                                 web_request: WebRequest
+                                 ) -> Dict[str, Any]:
+        """Handle USB rescan request"""
+        gcodes_path = self.file_paths.get("gcodes", "")
+        if not gcodes_path:
+            raise self.server.error("GCodes path not configured", 500)
+
+        full_usb_gcode_path = os.path.join(gcodes_path, USB_GCODE_DIR)
+
+        if not os.path.exists(full_usb_gcode_path):
+            raise self.server.error(f"Mount path does not exist: {USB_GCODE_DIR}", 404)
+
+        # Force a rescan of the USB mount
+        await self._scan_usb_mount(full_usb_gcode_path)
+
+        return {
+            "result": "success",
+            "message": f"USB mount {USB_GCODE_DIR} rescanned successfully"
+        }
 
     async def delete_file(self, path: str) -> Dict[str, Any]:
         async with self.sync_lock:
@@ -1130,6 +1268,150 @@ class FileManager:
         self.scheduled_notifications.clear()
         self.fs_observer.close()
 
+    async def _start_usb_mount_monitoring(self) -> None:
+        """Start monitoring for USB mount points changes in gcodes directory"""
+        gcodes_path = self.file_paths.get("gcodes", "")
+        if not gcodes_path:
+            return
+
+        # Check for .udisk directory
+        udisk_path = os.path.join(gcodes_path, USB_GCODE_DIR)
+        if os.path.exists(udisk_path):
+            self.usb_mount_paths.add(udisk_path)
+
+        # Schedule periodic checks for mount changes
+        self.event_loop.register_callback(self._check_usb_mounts)
+
+    async def _check_usb_mounts(self) -> None:
+        """Periodically check for changes in USB mount points"""
+        try:
+            gcodes_path = self.file_paths.get("gcodes", "")
+            if not gcodes_path:
+                return
+
+            udisk_path = os.path.join(gcodes_path, USB_GCODE_DIR)
+            async with self.usb_scan_lock:
+                # Check if udisk is mounted (has files or is a mount point)
+                is_mounted = False
+                if os.path.exists(udisk_path):
+                    try:
+                        # Check if it's a mount point by comparing device IDs
+                        parent_stat = os.stat(USB_MOUNT_PARENT)
+                        udisk_stat = os.stat(USB_MOUNT_POINT)
+                        is_mounted = (parent_stat.st_dev != udisk_stat.st_dev) or bool(os.listdir(udisk_path))
+                    except (OSError, PermissionError):
+                        is_mounted = False
+
+                if is_mounted and udisk_path not in self.usb_mount_paths:
+                    # USB device was mounted
+                    logging.info(f"USB device mounted at {udisk_path}")
+                    self.usb_mount_paths.add(udisk_path)
+                    await self._scan_usb_mount(udisk_path)
+                elif not is_mounted and udisk_path in self.usb_mount_paths:
+                    # USB device was unmounted
+                    logging.info(f"USB device unmounted from {udisk_path}")
+                    self.usb_mount_paths.discard(udisk_path)
+                    # Clear metadata for files that were in the USB device
+                    await self._cleanup_usb_metadata(udisk_path)
+
+        except Exception as e:
+            logging.exception(f"Error checking USB mounts: {e}")
+        finally:
+            # Schedule next check
+            self.event_loop.delay_callback(
+                self.mount_check_interval, self._check_usb_mounts
+            )
+
+    async def _scan_usb_mount(self, mount_path: str) -> None:
+        """Scan newly mounted USB device for gcode files and generate metadata"""
+        try:
+            if not os.path.isdir(mount_path):
+                return
+
+            # logging.info(f"Scanning USB mount at {mount_path} for gcode files")
+            gcode_files = []
+
+            # Walk through the mounted directory to find gcode files
+            for root, dirs, files in os.walk(mount_path):
+                for file in files:
+                    file_path = os.path.join(root, file)
+                    ext = os.path.splitext(file)[-1].lower()
+                    if ext in VALID_GCODE_EXTS:
+                        gcode_files.append(file_path)
+
+            if not gcode_files:
+                logging.info("No gcode files found in USB mount")
+                return
+
+            logging.info(f"Found {len(gcode_files)} gcode files in USB mount, generating metadata")
+
+            # For USB mounts, we don't need to reset all watches as they may not support inotify well
+            # Instead, we'll focus on metadata generation and let periodic checks handle future changes
+            # logging.info("Skipping inotify watch setup for USB mount (USB filesystems may not support inotify reliably)")
+
+            # for now we won't generate metadata for all files, screen will request as needed
+
+        except Exception as e:
+            logging.exception(f"Error scanning USB mount {mount_path}: {e}")
+
+    async def _cleanup_usb_metadata(self, mount_path: str) -> None:
+        """Clean up metadata for files that were in the unmounted USB device"""
+        try:
+            gcodes_path = self.file_paths.get("gcodes", "")
+            if not gcodes_path:
+                return
+
+            # Get relative path of the mount point
+            rel_mount_path = os.path.relpath(mount_path, gcodes_path)
+
+            # Find and remove metadata for files that were in this mount
+            removed_files = []
+            for filename in list(self.gcode_metadata.metadata.keys()):
+                if filename.startswith(rel_mount_path + "/") or filename.startswith(rel_mount_path + "\\"):
+                    removed_files.append(filename)
+
+            if removed_files:
+                logging.info(f"Cleaning up metadata for {len(removed_files)} files from unmounted USB")
+                for filename in removed_files:
+                    ret = self.gcode_metadata.remove_file_metadata(filename)
+                    if ret is not None:
+                        await ret
+
+                # Notify clients about the removed files
+                self._sched_changed_event("root_update", "gcodes", mount_path, immediate=True)
+
+        except Exception as e:
+            logging.exception(f"Error cleaning up USB metadata: {e}")
+
+    def is_path_on_usb_mount(self, path: str) -> bool:
+        """Check if a given path is on a USB mount point"""
+        path = os.path.abspath(path)
+        for mount_path in self.usb_mount_paths:
+            if path.startswith(mount_path + os.sep) or path == mount_path:
+                return True
+        return False
+
+    def should_skip_watch(self, path: str) -> bool:
+        """Determine if we should skip adding inotify watch for a path"""
+        # Skip watches for USB mounts as they often don't support inotify well
+        if self.is_path_on_usb_mount(path):
+            return True
+
+        # Skip system directories that are commonly problematic
+        path_lower = path.lower()
+        skip_dirs = [
+            'system volume information',
+            '$recycle.bin',
+            '.trashes',
+            '.spotlight-v100',
+            '.ds_store'
+        ]
+
+        for skip_dir in skip_dirs:
+            if skip_dir in path_lower:
+                return True
+
+        return False
 
 class NotifySyncLock(asyncio.Lock):
     def __init__(self, config: ConfigHelper) -> None:
@@ -1474,7 +1756,24 @@ class InotifyNode:
         self.name = name
         self.parent_node = parent
         self.child_nodes: Dict[str, InotifyNode] = {}
-        self.watch_desc = self.iobsvr.add_watch(self)
+
+        # Check if we should skip adding watch for this path
+        node_path = self.get_path()
+        file_manager = getattr(iobsvr, 'file_manager', None)
+        should_skip = False
+        if file_manager and hasattr(file_manager, 'should_skip_watch'):
+            should_skip = file_manager.should_skip_watch(node_path)
+
+        if should_skip:
+            logging.debug(f"Skipping inotify watch for path: {node_path}")
+            self.watch_desc = -1  # Use -1 to indicate no watch
+        else:
+            try:
+                self.watch_desc = self.iobsvr.add_watch(self)
+            except Exception:
+                logging.debug(f"Failed to add watch for {node_path}, continuing without watch")
+                self.watch_desc = -1  # Use -1 to indicate no watch
+
         self.pending_node_events: Dict[str, asyncio.Handle] = {}
         self.pending_deleted_children: Set[Tuple[str, bool]] = set()
         self.pending_file_events: Dict[str, str] = {}
@@ -1671,7 +1970,9 @@ class InotifyNode:
         for cnode in self.child_nodes.values():
             # Delete all of the children's children
             cnode.clear_watches()
-        self.iobsvr.remove_watch(self.watch_desc)
+        # Only try to remove watch if one was actually added
+        if self.watch_desc != -1:
+            self.iobsvr.remove_watch(self.watch_desc)
 
     def get_path(self) -> str:
         return os.path.join(self.parent_node.get_path(), self.name)
@@ -1908,6 +2209,27 @@ class InotifyObserver(BaseFileSystemObserver):
         dir_path = node.get_path()
         try:
             watch: int = self.inotify.add_watch(dir_path, WATCH_FLAGS)
+        except OSError as e:
+            # Handle common USB/removable media filesystem issues
+            if e.errno == 28:  # No space left on device (too many watches)
+                logging.warning(f"Cannot add inotify watch to '{dir_path}': No space for more watches")
+                raise
+            elif e.errno == 22:  # Invalid argument (filesystem doesn't support inotify)
+                logging.debug(f"Filesystem at '{dir_path}' doesn't support inotify, skipping watch")
+                raise
+            elif e.errno == 13:  # Permission denied
+                logging.debug(f"Permission denied adding watch to '{dir_path}', skipping")
+                raise
+            else:
+                msg = (
+                    f"Error adding inotify watch to root '{node.get_root()}', "
+                    f"path: {dir_path} (errno: {e.errno})"
+                )
+                logging.warning(msg)
+                if self.enable_warn:
+                    msg = f"file_manager: {msg}"
+                    self.server.add_warning(msg, log=False)
+                raise
         except Exception:
             msg = (
                 f"Error adding inotify watch to root '{node.get_root()}', "
@@ -1944,8 +2266,16 @@ class InotifyObserver(BaseFileSystemObserver):
         if need_low_level_rm and node is not None:
             try:
                 self.inotify.rm_watch(wdesc)
-            except Exception:
-                logging.exception(f"Error removing watch: '{node.get_path()}'")
+            except OSError as e:
+                # Handle common inotify errors gracefully
+                if e.errno == 22:  # Invalid argument - watch descriptor already invalid
+                    logging.debug(f"Watch descriptor {wdesc} already invalid for path: '{node.get_path()}'")
+                elif e.errno == 2:  # No such file or directory
+                    logging.debug(f"Path no longer exists for watch removal: '{node.get_path()}'")
+                else:
+                    logging.warning(f"Error removing inotify watch for '{node.get_path()}': {e}")
+            except Exception as e:
+                logging.warning(f"Unexpected error removing watch for '{node.get_path()}': {e}")
 
     def log_nodes(self) -> None:
         if self.server.is_verbose_enabled():
@@ -2311,11 +2641,11 @@ class MetadataStorage:
                 if not os.path.isfile(fpath):
                     del self.metadata[fname]
                     del_keys.append(fname)
-                elif "thumbnails" in self.metadata[fname]:
+                elif "thumbnails" in self.metadata[fname] and isinstance(self.metadata[fname].get('thumbnails'), list):
                     # Check for any stale data entries and remove them
                     need_sync = False
                     for thumb in self.metadata[fname]['thumbnails']:
-                        if 'data' in thumb:
+                        if isinstance(thumb, dict) and 'data' in thumb:
                             del thumb['data']
                             need_sync = True
                     if need_sync:
@@ -2397,13 +2727,22 @@ class MetadataStorage:
         for fname, metadata in records.items():
             # Delete associated thumbnails
             fdir = os.path.dirname(os.path.join(self.gc_path, fname))
+
+            # Get top-level .thumbs directory
+            root_thumbs_dir = os.path.join(self.gc_path, ".thumbs")
+
+            # Calculate the actual path of thumbnails
+            file_thumb_dir = os.path.join(root_thumbs_dir, os.path.dirname(fname))
+
             if "thumbnails" in metadata:
                 thumb: Dict[str, Any]
                 for thumb in metadata["thumbnails"]:
                     path: Optional[str] = thumb.get("relative_path", None)
                     if path is None:
                         continue
-                    thumb_path = os.path.join(fdir, path)
+
+                    # Build the full path of thumbnail
+                    thumb_path = os.path.join(self.gc_path, path)
                     if not os.path.isfile(thumb_path):
                         continue
                     try:
@@ -2453,15 +2792,44 @@ class MetadataStorage:
     ) -> None:
         eventloop = self.server.get_event_loop()
         for (prev_fname, new_fname, metadata) in records:
-            prev_dir = os.path.dirname(os.path.join(self.gc_path, prev_fname))
-            new_dir = os.path.dirname(os.path.join(self.gc_path, new_fname))
+            # Calculate source and destination thumbnail paths
+            root_thumbs_dir = os.path.join(self.gc_path, ".thumbs")
+            prev_thumb_dir = os.path.join(root_thumbs_dir, os.path.dirname(prev_fname))
+            new_thumb_dir = os.path.join(root_thumbs_dir, os.path.dirname(new_fname))
+
             if "thumbnails" in metadata:
                 thumb: Dict[str, Any]
                 for thumb in metadata["thumbnails"]:
                     path: Optional[str] = thumb.get("relative_path", None)
                     if path is None:
                         continue
-                    thumb_path = os.path.join(prev_dir, path)
+
+                    # Build source and destination thumbnail paths
+                    thumb_path = os.path.join(self.gc_path, path)
+                    if not os.path.isfile(thumb_path):
+                        continue
+
+                    # Calculate new thumbnail path
+                    thumb_name = os.path.basename(path)
+                    if os.path.dirname(new_fname) == "":
+                        new_path = os.path.join(root_thumbs_dir, thumb_name)
+                    else:
+                        new_path = os.path.join(root_thumbs_dir, os.path.dirname(new_fname), thumb_name)
+
+                    new_parent = os.path.dirname(new_path)
+                    try:
+                        if not os.path.exists(new_parent):
+                            os.makedirs(new_parent)
+                        await eventloop.run_in_thread(
+                            shutil.move, thumb_path, new_path
+                        )
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        logging.exception(
+                            f"Error moving thumb from {thumb_path} to {new_path}"
+                        )
+
                     if not os.path.isfile(thumb_path):
                         continue
                     new_path = os.path.join(new_dir, path)

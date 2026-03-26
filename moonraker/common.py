@@ -801,6 +801,7 @@ class JsonRPC:
                 return self.build_error(
                     -32602, "Invalid params:", req_id, method_name=method_name
                 )
+        params['req_id'] = req_id
         return await self.execute_method(
             method_name, request_type, api_definition, req_id, transport, params
         )
@@ -859,6 +860,8 @@ class JsonRPC:
             return self.build_error(-31000, str(e), req_id, True, method_name)
 
         if req_id is None:
+            return None
+        elif result is None:
             return None
         else:
             return self.build_result(result, req_id)

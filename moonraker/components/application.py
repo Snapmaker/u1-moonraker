@@ -474,7 +474,7 @@ def _set_cors_headers(req_hdlr: tornado.web.RequestHandler) -> None:
             "Access-Control-Allow-Headers",
             "Origin, Accept, Content-Type, X-Requested-With, "
             "X-CRSF-Token, Authorization, X-Access-Token, "
-            "X-Api-Key"
+            "X-Api-Key, Cache-Control"
         )
         req_pvt_header = req_hdlr.request.headers.get(
             "Access-Control-Request-Private-Network", None
@@ -937,7 +937,8 @@ class FileUploadHandler(AuthorizedRequestHandler):
         self.max_upload_size = max_upload_size
         self.parse_lock = Lock()
         self.parse_failed: bool = False
-
+        self._space_checked: bool = False
+        self._last_space_check = 0
     async def prepare(self) -> None:
         ret = super(FileUploadHandler, self).prepare()
         if ret is not None:
@@ -947,9 +948,30 @@ class FileUploadHandler(AuthorizedRequestHandler):
             f"Upload Request Received from {self.request.remote_ip}\n"
             f"Content-Type: {content_type}"
         )
-        fm: FileManager = self.server.lookup_component("file_manager")
-        fm.check_write_enabled()
+        self.file_manager.check_write_enabled()
         if self.request.method == "POST":
+            # Check disk space before processing upload
+            # Extract root from request headers or use default
+            content_length = self.request.headers.get("Content-Length")
+
+            # If Content-Length is provided, check disk space
+            if content_length is not None:
+                try:
+                    required_space = int(content_length)
+                    if not self.file_manager.check_gcodes_space(required_space):
+                        raise tornado.web.HTTPError(
+                            413, "Insufficient disk space for file upload"
+                        )
+                    self._space_checked = True
+                except ValueError:
+                    # If we can't parse Content-Length, we'll check later during finalize_upload
+                    pass
+            else:
+                logging.info(
+                    "Content-Length header not provided, "
+                    "will check disk space during upload"
+                )
+
             assert isinstance(self.request.connection, HTTP1Connection)
             self.request.connection.set_max_body_size(self.max_upload_size)
             tmpname = self.file_manager.gen_temp_upload_path()
@@ -969,6 +991,28 @@ class FileUploadHandler(AuthorizedRequestHandler):
 
     async def data_received(self, chunk: bytes) -> None:
         if self.request.method == "POST" and not self.parse_failed:
+            # Check disk space during file upload
+            # If Content-Length was not provided in headers, we need to check during upload
+            if self._space_checked is False:
+                # Only check if Content-Length was not provided
+                file_size = os.path.getsize(self._file.filename)
+                free_space, _ = self.file_manager.get_user_space()
+                if self._last_space_check == 0 and free_space <= 0:
+                    self.parse_failed = True
+                    logging.exception("Insufficient disk space during file upload")
+                    raise tornado.web.HTTPError(
+                        413, "Insufficient disk space for file upload"
+                    )
+                # Check disk space every 10MB of data received
+                if file_size > self._last_space_check + 10 * 1024 * 1024:
+                    if free_space <= 0:
+                        self.parse_failed = True
+                        logging.exception("Insufficient disk space during file upload")
+                        raise tornado.web.HTTPError(
+                            413, "Insufficient disk space for file upload"
+                        )
+                    self._last_space_check = file_size
+
             async with self.parse_lock:
                 evt_loop = self.server.get_event_loop()
                 try:
@@ -1017,6 +1061,11 @@ class FileUploadHandler(AuthorizedRequestHandler):
         try:
             result = await self.file_manager.finalize_upload(form_args)
         except ServerError as e:
+            # Remove temporary file if processing failed
+            try:
+                os.remove(form_args['tmp_file_path'])
+            except Exception:
+                pass
             raise tornado.web.HTTPError(
                 e.status_code, str(e))
         # Return 201 and add the Location Header

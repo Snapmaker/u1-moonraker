@@ -1,51 +1,56 @@
-# Wrapper around Tornado's HTTP Client with a "requests-like" interface
+# Wrapper around httpx AsyncClient for Moonraker
 #
-# Copyright (C) 2022 Eric Callahan <arksine.code@gmail.com>
+# Copyright (C) 2025 Scott Huang <shili.huang@snapmaker.com>
 #
 # This file may be distributed under the terms of the GNU GPLv3 license
 
 from __future__ import annotations
-import re
-import time
+
 import asyncio
-import pathlib
-import tempfile
-import logging
 import copy
-from ..utils import ServerError
-from ..utils import json_wrapper as jsonw
-from tornado.escape import url_unescape
-from tornado.httpclient import AsyncHTTPClient, HTTPRequest, HTTPError
-from tornado.httputil import HTTPHeaders
-from tornado.simple_httpclient import HTTPTimeoutError
+import logging
+import pathlib
+import re
+import tempfile
+import time
 from typing import (
     TYPE_CHECKING,
+    Any,
     Callable,
+    Dict,
+    List,
     Optional,
     Tuple,
     Union,
-    Dict,
-    List,
-    Any
 )
+
+import httpx
+
+from ..utils import ServerError
+from ..utils import json_wrapper as jsonw
+from tornado.escape import url_unescape
+from tornado.httputil import HTTPHeaders
+
 if TYPE_CHECKING:
-    from ..server import Server
     from ..confighelper import ConfigHelper
+    from ..server import Server
     from io import BufferedWriter
     StrOrPath = Union[str, pathlib.Path]
 
-MAX_BODY_SIZE = 512 * 1024 * 1024
-AsyncHTTPClient.configure(
-    None, defaults=dict(user_agent="Moonraker"),
-    max_body_size=MAX_BODY_SIZE
-)
 
 GITHUB_PREFIX = "https://api.github.com/"
 
-class HttpClient:
+
+class HttpxClient:
     def __init__(self, config: ConfigHelper) -> None:
         self.server = config.get_server()
-        self.client = AsyncHTTPClient()
+        # Silence verbose httpx/httpcore request logging which can flood Moonraker logs
+        logging.getLogger("httpx").setLevel(logging.WARNING)
+        logging.getLogger("httpcore").setLevel(logging.WARNING)
+        self.client = httpx.AsyncClient(
+            headers={"User-Agent": "Moonraker"},
+            follow_redirects=True,
+        )
         self.response_cache: Dict[str, HttpResponse] = {}
 
         self.gh_rate_limit: Optional[int] = None
@@ -56,7 +61,7 @@ class HttpClient:
         self,
         url: str,
         etag: Optional[str] = None,
-        last_modified: Optional[str] = None
+        last_modified: Optional[str] = None,
     ) -> None:
         headers = HTTPHeaders()
         if etag is not None:
@@ -65,7 +70,8 @@ class HttpClient:
             headers["last-modified"] = last_modified
         if len(headers) == 0:
             raise self.server.error(
-                "Either an Etag or Last Modified Date must be specified")
+                "Either an Etag or Last Modified Date must be specified"
+            )
         empty_resp = HttpResponse(url, url, 200, b"", headers, None)
         self.response_cache[url] = empty_resp
 
@@ -75,83 +81,128 @@ class HttpClient:
         url: str,
         body: Optional[Union[bytes, str, List[Any], Dict[str, Any]]] = None,
         headers: Optional[Dict[str, Any]] = None,
-        connect_timeout: float = 5.,
-        request_timeout: float = 10.,
+        connect_timeout: float = 5.0,
+        request_timeout: float = 10.0,
         attempts: int = 1,
-        retry_pause_time: float = .1,
+        retry_pause_time: float = 0.1,
         enable_cache: bool = False,
         send_etag: bool = True,
         send_if_modified_since: bool = True,
         basic_auth_user: Optional[str] = None,
-        basic_auth_pass: Optional[str] = None
+        basic_auth_pass: Optional[str] = None,
     ) -> HttpResponse:
         cache_key = url.split("?", 1)[0]
         method = method.upper()
-        # prepare the body if required
+
         req_headers: Dict[str, Any] = {}
+        request_body: Optional[bytes]
         if isinstance(body, (list, dict)):
-            body = jsonw.dumps(body)
+            request_body = jsonw.dumps(body).encode("utf-8")
             req_headers["Content-Type"] = "application/json"
+        elif isinstance(body, str):
+            request_body = body.encode("utf-8")
+        else:
+            request_body = body
+
         cached: Optional[HttpResponse] = None
         if enable_cache:
             cached = self.response_cache.get(cache_key)
-            if cached is not None and send_etag:
+            if cached is not None:
                 if cached.etag is not None and send_etag:
                     req_headers["If-None-Match"] = cached.etag
                 if cached.last_modified and send_if_modified_since:
                     req_headers["If-Modified-Since"] = cached.last_modified
-        if headers is not None:
-            headers.update(req_headers)
-        elif req_headers:
-            headers = req_headers
 
-        timeout = 1 + connect_timeout + request_timeout
-        req_args: Dict[str, Any] = dict(
-            body=body,
-            request_timeout=request_timeout,
-            connect_timeout=connect_timeout
+        request_headers: Optional[Dict[str, Any]] = None
+        if headers is not None:
+            request_headers = headers.copy()
+            if req_headers:
+                request_headers.update(req_headers)
+        elif req_headers:
+            request_headers = req_headers.copy()
+
+        timeout = httpx.Timeout(
+            connect=connect_timeout,
+            read=request_timeout,
+            write=request_timeout,
+            pool=connect_timeout,
         )
+        auth: Optional[Tuple[str, str]] = None
         if basic_auth_user is not None:
             assert basic_auth_pass is not None
-            req_args["auth_username"] = basic_auth_user
-            req_args["auth_password"] = basic_auth_pass
-            req_args["auth_mode"] = "basic"
-        request = HTTPRequest(url, method, headers, **req_args)
+            auth = (basic_auth_user, basic_auth_pass)
+
         err: Optional[BaseException] = None
-        for i in range(attempts):
-            if i:
+        ret: Optional[HttpResponse] = None
+
+        for attempt in range(attempts):
+            if attempt:
                 await asyncio.sleep(retry_pause_time)
+
+            response: Optional[httpx.Response] = None
             try:
-                fut = self.client.fetch(request, raise_error=False)
-                resp = await asyncio.wait_for(fut, timeout)
+                response = await self.client.request(
+                    method=method,
+                    url=url,
+                    headers=request_headers,
+                    content=request_body,
+                    timeout=timeout,
+                    auth=auth,
+                )
             except asyncio.CancelledError:
                 raise
-            except Exception as e:
-                err = e
-            else:
-                err = resp.error
-                if resp.code == 304:
+            except Exception as exc:
+                err = exc
+                if attempt + 1 == attempts:
+                    break
+                continue
+
+            try:
+                headers_obj = HTTPHeaders(response.headers)
+                final_url = str(response.url)
+                error: Optional[BaseException] = None
+
+                if response.status_code == 304:
                     err = None
                     if cached is None:
                         if enable_cache:
                             logging.info(
-                                "Request returned 304, however no cached "
-                                "item was found")
+                                "Request returned 304, however no cached item was found"
+                            )
                         result = b""
                     else:
                         logging.debug(f"Request returned from cache: {url}")
                         result = cached.content
-                elif resp.error is not None and attempts - i != 1:
-                    continue
                 else:
-                    result = resp.body
+                    result = response.content
+                    if response.status_code >= 400:
+                        try:
+                            response.raise_for_status()
+                        except httpx.HTTPError as exc:
+                            error = exc
+                            err = exc
+
                 ret = HttpResponse(
-                    url, resp.effective_url, resp.code, result,
-                    resp.headers, err
+                    url,
+                    final_url,
+                    response.status_code,
+                    result,
+                    headers_obj,
+                    error,
                 )
+
+                if response.status_code == 304:
+                    break
+                if ret.has_error() and attempt + 1 != attempts:
+                    continue
                 break
-        else:
+            finally:
+                if response is not None:
+                    await response.aclose()
+
+        if ret is None:
             ret = HttpResponse(url, url, 500, b"", HTTPHeaders(), err)
+
         if enable_cache and ret.is_cachable():
             logging.debug(f"Caching HTTP Response: {url}")
             self.response_cache[cache_key] = ret
@@ -160,7 +211,7 @@ class HttpClient:
         return ret
 
     async def get(
-        self, url: str, headers: Optional[Dict[str, Any]] = None, **kwargs
+        self, url: str, headers: Optional[Dict[str, Any]] = None, **kwargs: Any
     ) -> HttpResponse:
         if "enable_cache" not in kwargs:
             kwargs["enable_cache"] = True
@@ -171,7 +222,7 @@ class HttpClient:
         url: str,
         body: Union[str, List[Any], Dict[str, Any]] = "",
         headers: Optional[Dict[str, Any]] = None,
-        **kwargs
+        **kwargs: Any,
     ) -> HttpResponse:
         return await self.request("POST", url, body, headers, **kwargs)
 
@@ -179,7 +230,7 @@ class HttpClient:
         self,
         url: str,
         headers: Optional[Dict[str, Any]] = None,
-        **kwargs
+        **kwargs: Any,
     ) -> HttpResponse:
         return await self.request("DELETE", url, None, headers, **kwargs)
 
@@ -187,12 +238,12 @@ class HttpClient:
         self,
         resource: str,
         attempts: int = 1,
-        retry_pause_time: float = .1
+        retry_pause_time: float = 0.1,
     ) -> HttpResponse:
         url = f"{GITHUB_PREFIX}{resource.strip('/')}"
         if (
-            self.gh_limit_reset_time is not None and
-            self.gh_limit_remaining == 0
+            self.gh_limit_reset_time is not None
+            and self.gh_limit_remaining == 0
         ):
             curtime = time.time()
             if curtime < self.gh_limit_reset_time:
@@ -204,39 +255,48 @@ class HttpClient:
                 )
         headers = {"Accept": "application/vnd.github.v3+json"}
         resp = await self.get(
-            url, headers, attempts=attempts,
-            retry_pause_time=retry_pause_time)
+            url,
+            headers,
+            attempts=attempts,
+            retry_pause_time=retry_pause_time,
+        )
         resp_hdrs = resp.headers
-        if 'X-Ratelimit-Limit' in resp_hdrs:
-            self.gh_rate_limit = int(resp_hdrs['X-Ratelimit-Limit'])
+        if "X-Ratelimit-Limit" in resp_hdrs:
+            self.gh_rate_limit = int(resp_hdrs["X-Ratelimit-Limit"])
             self.gh_limit_remaining = int(
-                resp_hdrs['X-Ratelimit-Remaining'])
+                resp_hdrs["X-Ratelimit-Remaining"]
+            )
             self.gh_limit_reset_time = float(
-                resp_hdrs['X-Ratelimit-Reset'])
+                resp_hdrs["X-Ratelimit-Reset"]
+            )
         return resp
 
     def github_api_stats(self) -> Dict[str, Any]:
         return {
-            'github_rate_limit': self.gh_rate_limit,
-            'github_requests_remaining': self.gh_limit_remaining,
-            'github_limit_reset_time': self.gh_limit_reset_time,
+            "github_rate_limit": self.gh_rate_limit,
+            "github_requests_remaining": self.gh_limit_remaining,
+            "github_limit_reset_time": self.gh_limit_reset_time,
         }
 
     async def get_file(
         self,
         url: str,
         content_type: str,
-        connect_timeout: float = 5.,
-        request_timeout: float = 180.,
+        connect_timeout: float = 5.0,
+        request_timeout: float = 180.0,
         attempts: int = 1,
-        retry_pause_time: float = .1,
+        retry_pause_time: float = 0.1,
         enable_cache: bool = False,
     ) -> bytes:
         headers = {"Accept": content_type}
         resp = await self.get(
-            url, headers, connect_timeout=connect_timeout,
-            request_timeout=request_timeout, attempts=attempts,
-            retry_pause_time=retry_pause_time, enable_cache=enable_cache
+            url,
+            headers,
+            connect_timeout=connect_timeout,
+            request_timeout=request_timeout,
+            attempts=attempts,
+            retry_pause_time=retry_pause_time,
+            enable_cache=enable_cache,
         )
         resp.raise_for_status()
         return resp.content
@@ -248,61 +308,106 @@ class HttpClient:
         destination_path: Optional[StrOrPath] = None,
         download_size: int = -1,
         progress_callback: Optional[Callable[[int, int, int], None]] = None,
-        connect_timeout: float = 5.,
-        request_timeout: float = 180.,
+        connect_timeout: float = 5.0,
+        request_timeout: float = 180.0,
         attempts: int = 1,
-        retry_pause_time: float = 1.
+        retry_pause_time: float = 1.0,
     ) -> pathlib.Path:
         from urllib.parse import quote, urlparse, urlunparse
-        # Encode non-ASCII characters in URL
+
         parsed = urlparse(url)
         encoded_path = quote(parsed.path)
-        encoded_url = urlunparse((
-            parsed.scheme,
-            parsed.netloc,
-            encoded_path,
-            parsed.params,
-            parsed.query,
-            parsed.fragment
-        ))
-        for i in range(attempts):
+        encoded_url = urlunparse(
+            (
+                parsed.scheme,
+                parsed.netloc,
+                encoded_path,
+                parsed.params,
+                parsed.query,
+                parsed.fragment,
+            )
+        )
+
+        timeout = httpx.Timeout(
+            connect=connect_timeout,
+            read=request_timeout,
+            write=request_timeout,
+            pool=connect_timeout,
+        )
+
+        for attempt in range(attempts):
             dl = StreamingDownload(
-                self.server, destination_path, download_size,
-                progress_callback)
+                self.server,
+                destination_path,
+                download_size,
+                progress_callback,
+            )
+
             try:
-                fut = self.client.fetch(
-                    encoded_url, headers={"Accept": content_type},
-                    connect_timeout=connect_timeout,
-                    request_timeout=request_timeout,
-                    streaming_callback=dl.on_chunk_recd,
-                    header_callback=dl.on_headers_recd)
-                timeout = connect_timeout + request_timeout + 1.
-                resp = await asyncio.wait_for(fut, timeout)
-            except HTTPTimeoutError as e:
-                logging.error(f"Timeout downloading file: {url}, error: {e}")
-                raise asyncio.TimeoutError(str(e))
+                async with self.client.stream(
+                    "GET",
+                    encoded_url,
+                    headers={"Accept": content_type},
+                    timeout=timeout,
+                ) as response:
+                    headers_obj = HTTPHeaders(response.headers)
+                    dl.process_headers(response.status_code, headers_obj)
+
+                    if response.status_code >= 400:
+                        try:
+                            response.raise_for_status()
+                        except httpx.HTTPError:
+                            if attempt + 1 == attempts:
+                                raise
+                            await asyncio.sleep(retry_pause_time)
+                            continue
+
+                    async for chunk in response.aiter_bytes():
+                        dl.on_chunk_recd(chunk)
+            except httpx.TimeoutException as exc:
+                logging.error(f"Timeout downloading file, error: {exc}")
+                dl.cleanup_temp_file()
+                if attempt + 1 == attempts:
+                    raise asyncio.TimeoutError(str(exc))
+                await asyncio.sleep(retry_pause_time)
+                logging.info(
+                    "Retrying download file, attempt %s", attempt + 1
+                )
+                continue
             except asyncio.CancelledError:
                 raise
             except Exception:
-                if i + 1 == attempts:
+                dl.cleanup_temp_file()
+                if attempt + 1 == attempts:
                     raise
                 await asyncio.sleep(retry_pause_time)
                 continue
             finally:
                 await dl.close()
-            if resp.code < 400:
+
+            if dl.request_ok:
                 return dl.dest_file
+
+            dl.cleanup_temp_file()
+
+            if attempt + 1 != attempts:
+                await asyncio.sleep(retry_pause_time)
+
         raise self.server.error(f"Retries exceeded for request: {url}")
 
-    def wrap_request(self, default_url: str, **kwargs) -> HttpRequestWrapper:
+    def wrap_request(self, default_url: str, **kwargs: Any) -> HttpRequestWrapper:
         return HttpRequestWrapper(self, default_url, **kwargs)
 
-    def close(self):
-        self.client.close()
+    def close(self) -> None:
+        if self.client.is_closed:
+            return
+        event_loop = self.server.get_event_loop()
+        event_loop.register_callback(self.client.aclose)
+
 
 class HttpRequestWrapper:
     def __init__(
-        self, client: HttpClient, default_url: str, **kwargs
+        self, client: HttpxClient, default_url: str, **kwargs: Any
     ) -> None:
         self._do_request = client.request
         self._last_response: Optional[HttpResponse] = None
@@ -314,7 +419,7 @@ class HttpRequestWrapper:
         self.request_args = copy.deepcopy(self.default_request_args)
         self.reset()
 
-    async def send(self, **kwargs) -> HttpResponse:
+    async def send(self, **kwargs: Any) -> HttpResponse:
         req_args = copy.deepcopy(self.request_args)
         req_args.update(kwargs)
         method = req_args.pop("method", self.default_request_args["method"])
@@ -347,15 +452,17 @@ class HttpRequestWrapper:
     def last_response(self) -> Optional[HttpResponse]:
         return self._last_response
 
+
 class HttpResponse:
-    def __init__(self,
-                 url: str,
-                 final_url: str,
-                 code: int,
-                 result: bytes,
-                 response_headers: HTTPHeaders,
-                 error: Optional[BaseException]
-                 ) -> None:
+    def __init__(
+        self,
+        url: str,
+        final_url: str,
+        code: int,
+        result: bytes,
+        response_headers: HTTPHeaders,
+        error: Optional[BaseException],
+    ) -> None:
         self._url = url
         self._final_url = final_url
         self._code = code
@@ -365,7 +472,8 @@ class HttpResponse:
         self._etag: Optional[str] = response_headers.get("etag", None)
         self._error = error
         self._last_modified: Optional[str] = response_headers.get(
-            "last-modified", None)
+            "last-modified", None
+        )
 
     def json(self) -> Union[List[Any], Dict[str, Any]]:
         return jsonw.loads(self._result)
@@ -380,10 +488,9 @@ class HttpResponse:
         if self._error is not None:
             code = 500
             msg = f"HTTP Request Error: {self.url}"
-            if isinstance(self._error, HTTPError):
+            if isinstance(self._error, httpx.HTTPStatusError):
                 code = self._code
-                if self._error.message is not None:
-                    msg = self._error.message
+                msg = str(self._error)
             if message is not None:
                 msg = message
             raise ServerError(msg, code) from self._error
@@ -432,13 +539,14 @@ class HttpResponse:
     def error(self) -> Optional[BaseException]:
         return self._error
 
+
 class StreamingDownload:
     def __init__(
         self,
         server: Server,
         dest_path: Optional[StrOrPath],
         download_size: int,
-        progress_callback: Optional[Callable[[int, int, int], None]]
+        progress_callback: Optional[Callable[[int, int, int], None]],
     ) -> None:
         self.server = server
         self.event_loop = server.get_event_loop()
@@ -446,18 +554,18 @@ class StreamingDownload:
         self.need_content_disposition: bool = False
         self.request_ok: bool = False
         if dest_path is None:
-            # If no destination is provided initialize to a procedurally
-            # generated temp file.  We will attempt to extract the filename
-            # from the Content-Disposition Header
             tmp_dir = tempfile.gettempdir()
             loop_time = int(self.event_loop.get_loop_time())
             tmp_fname = f"moonraker.download-{loop_time}.mrd"
             self.dest_file = pathlib.Path(tmp_dir).joinpath(tmp_fname)
             self.need_content_disposition = True
+            self.generated_temp: bool = True
         elif isinstance(dest_path, str):
             self.dest_file = pathlib.Path(dest_path)
+            self.generated_temp = False
         else:
             self.dest_file = dest_path
+            self.generated_temp = False
         self.filename = self.dest_file.name
         self.file_hdl: Optional[BufferedWriter] = None
         self.total_recd: int = 0
@@ -468,48 +576,45 @@ class StreamingDownload:
         self.busy_evt: asyncio.Event = asyncio.Event()
         self.busy_evt.set()
 
-    def on_headers_recd(self, line: str) -> None:
-        if not self.need_content_length and not self.need_content_disposition:
-            return
-        line = line.strip()
-        rc_match = re.match(r"HTTP/\d.?\d? (\d+)", line)
-        if rc_match is not None:
-            self.request_ok = rc_match.group(1) == "200"
-            return
+    def process_headers(self, status_code: int, headers: HTTPHeaders) -> None:
+        self.request_ok = status_code < 400
         if not self.request_ok:
             return
-        parts = line.split(":", 1)
-        if len(parts) < 2:
-            return
-        hname = parts[0].strip().lower()
-        hval = parts[1].strip()
-        if hname == "content-length" and self.need_content_length:
-            self.download_size = int(hval)
-            self.need_content_length = False
-            logging.debug(
-                f"Content-Length header received: "
-                f"size = {self.download_size}")
-        elif (
-            hname == "content-disposition" and
-            self.need_content_disposition
-        ):
+        if self.need_content_length:
+            cl_header = headers.get("content-length")
+            if cl_header is not None:
+                self.download_size = int(cl_header)
+                self.need_content_length = False
+                logging.debug(
+                    "Content-Length header received: size = %s",
+                    self.download_size,
+                )
+        if self.need_content_disposition:
+            cd_header = headers.get("content-disposition")
+            if cd_header is None:
+                return
             fnr = r"filename[^;\n=]*=(['\"])?(utf-8\'\')?([^\n;]*)(?(1)\1|)"
-            matches: List[Tuple[str, str, str]] = re.findall(fnr, hval)
+            matches: List[Tuple[str, str, str]] = re.findall(fnr, cd_header)
             is_utf8 = False
             for (_, encoding, fname) in matches:
+                encoding = encoding or ""
                 if encoding.startswith("utf-8"):
-                    # Prefer the utf8 filename if included
                     self.filename = url_unescape(
-                        fname, encoding="utf-8", plus=False)
+                        fname, encoding="utf-8", plus=False
+                    )
                     is_utf8 = True
                     break
                 self.filename = fname
             self.need_content_disposition = False
-            # Use the filename extracted from the content-disposition header
             self.dest_file = self.dest_file.parent.joinpath(self.filename)
             logging.debug(
-                "Content-Disposition header received: filename = "
-                f"{self.filename}, utf8: {is_utf8}")
+                "Content-Disposition header received: filename = %s, utf8: %s",
+                self.filename,
+                is_utf8,
+            )
+        elif self.generated_temp:
+            # If no disposition header arrives we keep the temp filename
+            pass
 
     def on_chunk_recd(self, chunk: bytes) -> None:
         if not chunk:
@@ -520,28 +625,43 @@ class StreamingDownload:
         self.busy_evt.clear()
         self.event_loop.register_callback(self._process_buffer)
 
-    async def close(self):
+    async def close(self) -> None:
         await self.busy_evt.wait()
         if self.file_hdl is not None:
             await self.event_loop.run_in_thread(self.file_hdl.close)
 
-    async def _process_buffer(self):
+    async def _process_buffer(self) -> None:
         if self.file_hdl is None:
             self.file_hdl = await self.event_loop.run_in_thread(
-                self.dest_file.open, "wb")
+                self.dest_file.open, "wb"
+            )
         while self.chunk_buffer:
             chunk = self.chunk_buffer.pop(0)
             await self.event_loop.run_in_thread(self.file_hdl.write, chunk)
             self.total_recd += len(chunk)
-            if self.download_size > 0 and self.progress_callback is not None:
-                pct = int(self.total_recd / self.download_size * 100 + .5)
+            if (
+                self.download_size > 0
+                and self.progress_callback is not None
+            ):
+                pct = int(self.total_recd / self.download_size * 100 + 0.5)
                 pct = min(100, pct)
                 if pct != self.pct_done:
                     self.pct_done = pct
                     self.progress_callback(
-                        pct, self.download_size, self.total_recd)
+                        pct, self.download_size, self.total_recd
+                    )
         self.busy_evt.set()
 
+    def cleanup_temp_file(self) -> None:
+        if not getattr(self, "generated_temp", False):
+            return
+        try:
+            if self.dest_file.exists():
+                self.dest_file.unlink()
+        except FileNotFoundError:
+            pass
 
-def load_component(config: ConfigHelper) -> HttpClient:
-    return HttpClient(config)
+
+def load_component(config: ConfigHelper) -> HttpxClient:
+    return HttpxClient(config)
+

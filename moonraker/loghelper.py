@@ -43,9 +43,12 @@ class LocalQueueHandler(logging.handlers.QueueHandler):
             self.handleError(record)
 
 # Timed Rotating File Handler, based on Klipper's implementation
-class MoonrakerLoggingHandler(logging.handlers.TimedRotatingFileHandler):
+class MoonrakerLoggingHandler(logging.handlers.RotatingFileHandler):
     def __init__(self, app_args: Dict[str, Any], **kwargs) -> None:
-        super().__init__(app_args['log_file'], **kwargs)
+        # Set max log file size to 10MB, keep up to 10 backup files
+        max_bytes = kwargs.pop('maxBytes', 10 * 1024 * 1024)
+        backup_count = kwargs.pop('backupCount', 10)
+        super().__init__(app_args['log_file'], maxBytes=max_bytes, backupCount=backup_count, **kwargs)
         self.app_args = app_args
         self.rollover_info: Dict[str, str] = {}
 
@@ -70,6 +73,8 @@ class MoonrakerLoggingHandler(logging.handlers.TimedRotatingFileHandler):
             self.stream.write("\n".join(lines) + "\n")
 
 class LogManager:
+    FILE_SIZE = 10 * 1024 * 1024  # 10 MB
+    BACKUP_COUNT = 10
     def __init__(
         self, app_args: Dict[str, Any], startup_warnings: List[str]
     ) -> None:
@@ -93,7 +98,7 @@ class LogManager:
         if log_file:
             try:
                 self.file_hdlr = MoonrakerLoggingHandler(
-                    app_args, when='midnight', backupCount=2)
+                    app_args, maxBytes=self.FILE_SIZE, backupCount=self.BACKUP_COUNT)
                 formatter = logging.Formatter(
                     '%(asctime)s [%(filename)s:%(funcName)s()] - %(message)s')
                 self.file_hdlr.setFormatter(formatter)

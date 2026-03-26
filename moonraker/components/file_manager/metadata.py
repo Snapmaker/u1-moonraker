@@ -181,10 +181,19 @@ class BaseSlicer(object):
     def parse_object_height(self) -> Optional[float]:
         return None
 
+    def parse_filament_colour(self) -> Optional[str]:
+        return None
+
+    def parse_filament_weight(self) -> Optional[List[float]]:
+        return None
+
     def parse_filament_total(self) -> Optional[float]:
         return None
 
     def parse_filament_weight_total(self) -> Optional[float]:
+        return None
+
+    def parse_filament_retract_length_toolchange(self) -> Optional[List[float]]:
         return None
 
     def parse_filament_name(self) -> Optional[str]:
@@ -213,16 +222,42 @@ class BaseSlicer(object):
                 break
         else:
             return None
-        thumb_dir = os.path.join(os.path.dirname(self.path), ".thumbs")
+        # Create the top-level .thumbs directory
+        file_dir = os.path.dirname(self.path)
+
+        # Look for "gcodes" directory in the path as root_dir
+        path_parts = self.path.split(os.sep)
+        gcodes_index = -1
+        for i, part in enumerate(path_parts):
+            if part == "gcodes":
+                gcodes_index = i
+                break
+
+        if gcodes_index != -1:
+            # Found the "gcodes" directory
+            root_dir = os.sep.join(path_parts[:gcodes_index + 1])
+        else:
+            # No "gcodes" directory found, use the file's directory as root_dir
+            root_dir = file_dir
+
+        thumb_dir = os.path.join(root_dir, ".thumbs")
+
         if not os.path.exists(thumb_dir):
             try:
                 os.mkdir(thumb_dir)
             except Exception:
                 logger.info(f"Unable to create thumb dir: {thumb_dir}")
                 return None
+
+        # Calculate the path relative to root_dir
+        rel_path = os.path.relpath(file_dir, root_dir)
+        if rel_path != ".":
+            thumb_dir = os.path.join(thumb_dir, rel_path)
+            os.makedirs(thumb_dir, exist_ok=True)
+
         thumb_base = os.path.splitext(os.path.basename(self.path))[0]
         parsed_matches: List[Dict[str, Any]] = []
-        has_miniature: bool = False
+        has_medium: bool = False
         for match in thumb_matches:
             lines = re.split(r"\r?\n", match.replace('; ', ''))
             info = regex_find_ints(r"(%D)", lines[0])
@@ -239,16 +274,23 @@ class BaseSlicer(object):
                 continue
             thumb_name = f"{thumb_base}-{info[0]}x{info[1]}.png"
             thumb_path = os.path.join(thumb_dir, thumb_name)
-            rel_thumb_path = os.path.join(".thumbs", thumb_name)
+
+            # Calculate the thumbnail path relative to the gcode file's directory
+            if file_dir == root_dir:
+                rel_thumb_path = os.path.join(".thumbs", thumb_name)
+            else:
+                rel_path_from_root = os.path.relpath(file_dir, root_dir)
+                rel_thumb_path = os.path.join(".thumbs", rel_path_from_root, thumb_name)
+
             with open(thumb_path, "wb") as f:
                 f.write(base64.b64decode(data.encode()))
             parsed_matches.append({
                 'width': info[0], 'height': info[1],
                 'size': os.path.getsize(thumb_path),
                 'relative_path': rel_thumb_path})
-            if info[0] == 32 and info[1] == 32:
-                has_miniature = True
-        if len(parsed_matches) > 0 and not has_miniature:
+            if info[0] == 96 and info[1] == 96:
+                has_medium = True
+        if len(parsed_matches) > 0 and not has_medium:
             # find the largest thumb index
             largest_match = parsed_matches[0]
             for item in parsed_matches:
@@ -257,19 +299,26 @@ class BaseSlicer(object):
             # Create miniature thumbnail if one does not exist
             thumb_full_name = largest_match['relative_path'].split("/")[-1]
             thumb_path = os.path.join(thumb_dir, f"{thumb_full_name}")
-            rel_path_small = os.path.join(".thumbs", f"{thumb_base}-32x32.png")
-            thumb_path_small = os.path.join(
-                thumb_dir, f"{thumb_base}-32x32.png")
+
+            # Calculate the thumbnail path relative to the gcode file's directory
+            if file_dir == root_dir:
+                rel_path_medium = os.path.join(".thumbs", f"{thumb_base}-96x96.png")
+            else:
+                rel_path_from_root = os.path.relpath(file_dir, root_dir)
+                rel_path_medium = os.path.join(".thumbs", rel_path_from_root, f"{thumb_base}-96x96.png")
+
+            thumb_path_medium = os.path.join(
+                thumb_dir, f"{thumb_base}-96x96.png")
             # read file
             try:
                 with Image.open(thumb_path) as im:
-                    # Create 32x32 thumbnail
-                    im.thumbnail((32, 32))
-                    im.save(thumb_path_small, format="PNG")
+                    # Create 96x96 thumbnail
+                    im.thumbnail((96, 96))
+                    im.save(thumb_path_medium, format="PNG")
                     parsed_matches.insert(0, {
                         'width': im.width, 'height': im.height,
-                        'size': os.path.getsize(thumb_path_small),
-                        'relative_path': rel_path_small
+                        'size': os.path.getsize(thumb_path_medium),
+                        'relative_path': rel_path_medium
                     })
             except Exception as e:
                 logger.info(str(e))
@@ -314,6 +363,7 @@ class PrusaSlicer(BaseSlicer):
             'BambuStudio': r"BambuStudio[^ ]*\s(.*)\n",
             'A3dp-Slicer': r"A3dp-Slicer\s(.*)\son",
             'QIDISlicer': r"QIDISlicer\s(.*)\son",
+            'SnapmakerOrca': r"Snapmaker\sOrca\s(.*)\son",
         }
         for name, expr in aliases.items():
             match = re.search(expr, data)
@@ -357,6 +407,17 @@ class PrusaSlicer(BaseSlicer):
                 return max(matches)
         return regex_find_max_float(r"G1\sZ(%F)\sF", self.footer_data)
 
+    def parse_filament_colour(self) -> Optional[float]:
+                return regex_find_string(r";\sfilament_colour\s=\s(%S)", self.footer_data)
+
+    def parse_filament_weight(self) -> Optional[List[float]]:
+        line = regex_find_string(r'filament\sused\s\[g\]\s=\s(%S)\n', self.footer_data)
+        if line:
+            filament_weight = regex_find_floats(r"(%F)", line)
+            if filament_weight:
+                return filament_weight
+        return None
+
     def parse_filament_total(self) -> Optional[float]:
         line = regex_find_string(r'filament\sused\s\[mm\]\s=\s(%S)\n', self.footer_data)
         if line:
@@ -375,6 +436,25 @@ class PrusaSlicer(BaseSlicer):
 
     def parse_filament_type(self) -> Optional[str]:
         return regex_find_string(r";\sfilament_type\s=\s(%S)", self.footer_data)
+
+    def parse_filament_retract_length_toolchange(self) -> Optional[List[float]]:
+        # First check if the field exists (even if empty)
+        field_pattern = r'filament_retract_length_toolchange\s*='
+        if not re.search(field_pattern, self.footer_data):
+            # Field does not exist at all
+            return None
+
+        # Field exists, now try to extract values
+        # Use (.*)$ to capture empty values as well
+        line = regex_find_string(
+            r'filament_retract_length_toolchange\s*=\s*(.*)$', self.footer_data
+        )
+        if line:
+            retract_lengths = regex_find_floats(r"(%F)", line)
+            if retract_lengths:
+                return retract_lengths
+        # Field exists but no values found (empty or invalid)
+        return []
 
     def parse_filament_name(self) -> Optional[str]:
         return regex_find_string(
@@ -526,12 +606,44 @@ class Cura(BaseSlicer):
         if thumbs is not None:
             return thumbs
         # Check for thumbnails extracted from the ufp
-        thumb_dir = os.path.join(os.path.dirname(self.path), ".thumbs")
+        # Look for "gcodes" directory in the path as root_dir
+        file_dir = os.path.dirname(self.path)
+        path_parts = self.path.split(os.sep)
+        gcodes_index = -1
+        for i, part in enumerate(path_parts):
+            if part == "gcodes":
+                gcodes_index = i
+                break
+
+        if gcodes_index != -1:
+            # Found the "gcodes" directory
+            root_dir = os.sep.join(path_parts[:gcodes_index + 1])
+        else:
+            # No "gcodes" directory found, use the file's directory as root_dir
+            root_dir = file_dir
+
+        # In root_dir create .thumbs directory
+        thumb_dir = os.path.join(root_dir, ".thumbs")
+
+        # Calculate the path relative to root_dir
+        rel_path = os.path.relpath(file_dir, root_dir)
+        if rel_path != ".":
+            thumb_dir = os.path.join(thumb_dir, rel_path)
+            os.makedirs(thumb_dir, exist_ok=True)
+
         thumb_base = os.path.splitext(os.path.basename(self.path))[0]
+
+        # Calculate the thumbnail path relative to the gcode file's directory
+        if file_dir == root_dir:
+            rel_path_full = os.path.join(".thumbs", f"{thumb_base}.png")
+            rel_path_medium = os.path.join(".thumbs", f"{thumb_base}-96x96.png")
+        else:
+            rel_path_from_root = os.path.relpath(file_dir, root_dir)
+            rel_path_full = os.path.join(".thumbs", rel_path_from_root, f"{thumb_base}.png")
+            rel_path_medium = os.path.join(".thumbs", rel_path_from_root, f"{thumb_base}-96x96.png")
+
         thumb_path = os.path.join(thumb_dir, f"{thumb_base}.png")
-        rel_path_full = os.path.join(".thumbs", f"{thumb_base}.png")
-        rel_path_small = os.path.join(".thumbs", f"{thumb_base}-32x32.png")
-        thumb_path_small = os.path.join(thumb_dir, f"{thumb_base}-32x32.png")
+        thumb_path_medium = os.path.join(thumb_dir, f"{thumb_base}-96x96.png")
         if not os.path.isfile(thumb_path):
             return None
         # read file
@@ -543,13 +655,13 @@ class Cura(BaseSlicer):
                     'size': os.path.getsize(thumb_path),
                     'relative_path': rel_path_full
                 })
-                # Create 32x32 thumbnail
+                # Create 96x96 thumbnail
                 im.thumbnail((32, 32), Image.Resampling.LANCZOS)
-                im.save(thumb_path_small, format="PNG")
+                im.save(thumb_path_medium, format="PNG")
                 thumbs.insert(0, {
                     'width': im.width, 'height': im.height,
-                    'size': os.path.getsize(thumb_path_small),
-                    'relative_path': rel_path_small
+                    'size': os.path.getsize(thumb_path_medium),
+                    'relative_path': rel_path_medium
                 })
         except Exception as e:
             logger.info(str(e))
@@ -940,8 +1052,11 @@ SUPPORTED_DATA = [
     'chamber_temp',
     'filament_name',
     'filament_type',
+    'filament_weight',
+    'filament_colour',
     'filament_total',
     'filament_weight_total',
+    'filament_retract_length_toolchange',
     'thumbnails']
 
 def process_objects(file_path: str, slicer: BaseSlicer, name: str) -> bool:
