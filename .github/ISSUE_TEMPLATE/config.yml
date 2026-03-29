@@ -1,5 +1,5 @@
 blank_issues_enabled: false
 contact_links:
-  - name: Klipper Discord
-    url: https://discord.klipper3d.org/
-    about: Quickest way to get in contact
+  - name: Technical Issues
+    url: https://snapmaker.formcrafts.com/u1-troubleshooting-request
+    about: For trickier problems, you can submit a support request here
