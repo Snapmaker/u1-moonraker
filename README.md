@@ -41,3 +41,27 @@ The following projects deploy Moonraker via Docker:
 
 Please refer to the [changelog](https://moonraker.readthedocs.io/en/latest/changelog)
 for a list of notable changes to Moonraker.
+
+---
+
+# Moonraker for Snapmaker U1
+
+This is a project developed based on Moonraker specifically for Snapmaker U1.
+
+### Development
+
+Moonraker can be installed onto the target system by simply copying it.
+
+- First, you need to log in to the system and stop the moonraker process
+
+  ```
+  /etc/init.d/S61moonraker stop
+  ```
+
+- Second, copy the python source files and scripts in the "moonraker" and "scripts" subdirectories to the corresponding subdirectories in the device directory "/home/lava/moonraker".
+
+- Third, restart the device or restart the moonraker service. The device uses an overlay file system, so a temporary file /oem/.debug needs to be created to ensure that the updated moonraker is not overwritten. You can restart the moonraker service by using the following command
+
+  ```
+  /etc/init.d/S61moonraker start
+  ```
