@@ -219,7 +219,7 @@ class ZeroconfRegistrar:
                     self.zc_service_props["ip"] = str(ip_addr)
                 except ValueError:
                     pass
-            self.service_info.addresses = addresses
+            self.addresses = addresses
             self.service_info = AsyncServiceInfo(
                     ZC_SERVICE_TYPE,
                     self.zc_service_name,
