@@ -282,6 +282,66 @@ class KlippyAPI(APITransport):
             GCODE_ENDPOINT, params, default)
         return result
 
+    def _fill_metadata(self,
+                        metadata: Dict[str, Any],
+                        script: str) -> str:
+        metadata_fields = [
+            'line_width', 'layer_height', 'outer_wall_speed', 'nozzle_diameter_list',
+            'nozzle_temp', 'filament_type', 'filament_flow_ratio', 'filament_diameter',
+            'filament_max_vol_speed', 'filament_used_g', 'filament_used_mm'
+        ]
+        new_script_parts = []
+        for field in metadata_fields:
+            if field == 'filament_used_g':
+                value = metadata.get('filament_weight', None)
+            elif field == 'filament_type':
+                value = metadata.get(field, None)
+                if value is not None:
+                    value = [f'{item}' if item else 'NONE' for item in value.split(';')]
+            else:
+                value = metadata.get(field, None)
+            if value is not None:
+                new_script_parts.append(f' {field.upper()}="{value}"')
+        if new_script_parts:
+            new_script = ''.join(new_script_parts)
+            script += new_script
+        else:
+            logging.info("No metadata to add to script")
+        return script
+
+    async def start_print_advanced(
+        self,
+        filename: str,
+        wait_klippy_started: bool = False,
+        user: Optional[UserInfo] = None,
+        options: Optional[Dict[str, Any]] = None
+    ) -> str:
+        # WARNING: Do not call this method from within the following
+        # event handlers when "wait_klippy_started" is set to True:
+        # klippy_identified, klippy_started, klippy_ready, klippy_disconnect
+        # Doing so will result in "wait_started" blocking for the specifed
+        # timeout (default 20s) and returning False.
+        if not filename:
+            raise ValueError("filename cannot be empty")
+        if filename[0] == '/':
+            filename = filename[1:]
+        # Escape existing double quotes in the file name
+        filename = filename.replace("\"", "\\\"")
+        fm = self.server.lookup_component("file_manager")
+        metadata = fm.get_file_metadata(filename)
+        script = f'SDCARD_PRINT_FILE_WITH_PARAMETERS FILENAME="{filename}"'
+        for k, v in (options or {}).items():
+            script += ' {}'.format(str(k).upper())
+            script += '="{}"'.format(str(v))
+        if metadata:
+            script = self._fill_metadata(metadata, script)
+        if wait_klippy_started:
+            await self.klippy.wait_started()
+        logging.info(f"Requesting Job Start: {script}")
+        ret = await self.run_gcode(script)
+        self.server.send_event("klippy_apis:job_start_complete", user)
+        return ret
+
     async def start_print(
         self,
         filename: str,

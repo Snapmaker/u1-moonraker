@@ -46,23 +46,23 @@ logger = logging.getLogger("metadata")
 #  Integer: (%D) = (\d+)
 #  String: (%S) = (.+)
 def regex_find_floats(pattern: str, data: str) -> List[float]:
-    pattern = pattern.replace(r"(%F)", r"([0-9]*\.?[0-9]+)")
+    pattern = pattern.replace(r"(%F)", r"([0-9]*\.?[0-9]+|nil)")
     matches = re.findall(pattern, data)
     if matches:
         # return the maximum height value found
         try:
-            return [float(h) for h in matches]
+            return [0.0 if h == "nil" else float(h) for h in matches]
         except Exception:
             pass
     return []
 
 def regex_find_ints(pattern: str, data: str) -> List[int]:
-    pattern = pattern.replace(r"(%D)", r"([0-9]+)")
+    pattern = pattern.replace(r"(%D)", r"([0-9]+|nil)")
     matches = re.findall(pattern, data)
     if matches:
         # return the maximum height value found
         try:
-            return [int(h) for h in matches]
+            return [0 if h == "nil" else int(h) for h in matches]
         except Exception:
             pass
     return []
@@ -330,6 +330,30 @@ class BaseSlicer(object):
     def parse_nozzle_diameter(self) -> Optional[float]:
         return None
 
+    def parse_nozzle_diameter_list(self) -> Optional[float]:
+        return None
+
+    def parse_line_width(self) -> Optional[float]:
+        return None
+
+    def parse_outer_wall_speed(self) -> Optional[float]:
+        return None
+
+    def parse_filament_diameter(self) -> Optional[List[float]]:
+        return None
+
+    def parse_filament_max_volumetric_speed(self) -> Optional[List[float]]:
+        return None
+
+    def parse_filament_flow_ratio(self) -> Optional[List[float]]:
+        return None
+
+    def parse_filament_used_mm(self) -> Optional[List[float]]:
+        return None
+
+    def parse_nozzle_temp(self) -> Optional[List[float]]:
+        return None
+
 class UnknownSlicer(BaseSlicer):
     def check_identity(self, data: str) -> Optional[Dict[str, str]]:
         return {'slicer': "Unknown"}
@@ -438,23 +462,16 @@ class PrusaSlicer(BaseSlicer):
         return regex_find_string(r";\sfilament_type\s=\s(%S)", self.footer_data)
 
     def parse_filament_retract_length_toolchange(self) -> Optional[List[float]]:
-        # First check if the field exists (even if empty)
-        field_pattern = r'filament_retract_length_toolchange\s*='
-        if not re.search(field_pattern, self.footer_data):
-            # Field does not exist at all
-            return None
-
-        # Field exists, now try to extract values
         # Use (.*)$ to capture empty values as well
         line = regex_find_string(
-            r'filament_retract_length_toolchange\s*=\s*(.*)$', self.footer_data
+            r'filament_retract_length_toolchange\s=\s(%S)', self.footer_data
         )
         if line:
             retract_lengths = regex_find_floats(r"(%F)", line)
             if retract_lengths:
                 return retract_lengths
-        # Field exists but no values found (empty or invalid)
-        return []
+        # Field empty or invalid
+        return None
 
     def parse_filament_name(self) -> Optional[str]:
         return regex_find_string(
@@ -499,8 +516,62 @@ class PrusaSlicer(BaseSlicer):
             r";\snozzle_diameter\s=\s(%F)", self.footer_data
         )
 
+    def parse_nozzle_diameter_list(self) -> Optional[List[float]]:
+        line = regex_find_string(r'nozzle_diameter\s=\s(%S)\n', self.footer_data)
+        if line:
+            nozzle_diameter_list = regex_find_floats(r"(%F)", line)
+            if nozzle_diameter_list:
+                return nozzle_diameter_list
+        return None
     def parse_layer_count(self) -> Optional[int]:
         return regex_find_int(r"; total layers count = (%D)", self.footer_data)
+
+    def parse_line_width(self) -> Optional[float]:
+        return regex_find_float(r";\sline_width\s=\s(%F)", self.footer_data)
+
+    def parse_outer_wall_speed(self) -> Optional[float]:
+        return regex_find_float(r";\souter_wall_speed\s=\s(%F)", self.footer_data)
+
+    def parse_filament_diameter(self) -> Optional[List[float]]:
+        line = regex_find_string(r'filament_diameter\s=\s(%S)\n', self.footer_data)
+        if line:
+            filament_diameter = regex_find_floats(r"(%F)", line)
+            if filament_diameter:
+                return filament_diameter
+        return None
+
+    def parse_filament_max_volumetric_speed(self) -> Optional[List[float]]:
+        line = regex_find_string(r'filament_max_volumetric_speed\s=\s(%S)\n', self.footer_data)
+        if line:
+            filament_max_volumetric_speed = regex_find_floats(r"(%F)", line)
+            if filament_max_volumetric_speed:
+                return filament_max_volumetric_speed
+        return None
+
+    def parse_filament_flow_ratio(self) -> Optional[List[float]]:
+        line = regex_find_string(r'filament_flow_ratio\s=\s(%S)\n', self.footer_data)
+        if line:
+            filament_flow_ratio = regex_find_floats(r"(%F)", line)
+            if filament_flow_ratio:
+                return filament_flow_ratio
+        return None
+
+    def parse_filament_used_mm(self) -> Optional[List[float]]:
+        line = regex_find_string(r'filament\sused\s\[mm\]\s=\s(%S)\n', self.footer_data)
+        if line:
+            filament_used_mm = regex_find_floats(r"(%F)", line)
+            if filament_used_mm:
+                return filament_used_mm
+        return None
+
+    def parse_nozzle_temp(self) -> Optional[List[float]]:
+        line = regex_find_string(r'nozzle_temperature\s=\s(%S)\n', self.footer_data)
+        if line:
+            nozzle_temp = regex_find_floats(r"(%F)", line)
+            if nozzle_temp:
+                return nozzle_temp
+        return None
+
 
 class Slic3rPE(PrusaSlicer):
     def check_identity(self, data: str) -> Optional[Dict[str, str]]:
@@ -1057,6 +1128,14 @@ SUPPORTED_DATA = [
     'filament_total',
     'filament_weight_total',
     'filament_retract_length_toolchange',
+    'line_width',
+    'outer_wall_speed',
+    'filament_diameter',
+    'filament_used_mm',
+    'filament_max_volumetric_speed',
+    'filament_flow_ratio',
+    'nozzle_temp',
+    'nozzle_diameter_list',
     'thumbnails']
 
 def process_objects(file_path: str, slicer: BaseSlicer, name: str) -> bool:

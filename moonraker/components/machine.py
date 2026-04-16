@@ -24,7 +24,7 @@ import json
 from ..confighelper import FileSourceWrapper
 from ..utils import source_info, cansocket, sysfs_devs, load_system_module
 from ..utils import json_wrapper as jsonw
-from ..common import RequestType
+from ..common import RequestType, KlippyState
 
 # Annotation imports
 from typing import (
@@ -170,6 +170,9 @@ class Machine:
         self.server.register_endpoint(
             "/machine/set_device_name", RequestType.POST, self._handle_set_device_name
         )
+        self.server.register_endpoint(
+            "/machine/heartbeat", RequestType.POST, self._handle_heartbeat
+        )
         self.server.register_notification("machine:service_state_changed")
         self.server.register_notification("machine:sudo_alert")
 
@@ -191,9 +194,78 @@ class Machine:
         self.libcam = self._try_import_libcamera()
 
         self.server.register_event_handler(
-            "server:klippy_ready", self._show_product_info)
+            "server:klippy_started", self._handle_klippy_started)
         self.server.register_event_handler(
             "server:klippy_shutdown", self._show_product_info)
+
+        # Extruder name to index mapping (fixed)
+        self._extruder_subscription: Dict[str, int] = {
+            "extruder": 0, "extruder1": 1, "extruder2": 2, "extruder3": 3,
+        }
+        self._last_nozzle_diameter: List[float] = [0.4, 0.4, 0.4, 0.4]
+        # machine_state_manager cache
+        self._msm_status: Dict[str, Any] = {}
+
+    async def _handle_klippy_started(self, state: KlippyState) -> None:
+        """Subscribe to machine_state_manager and extruder parameters."""
+        if state != KlippyState.READY:
+            return
+        try:
+            kapis = self.server.lookup_component('klippy_apis')
+            # Subscribe to machine_state_manager parameters (None = subscribe to all)
+            sub: Dict[str, Optional[List[str]]] = {"machine_state_manager": None}
+            # Preserve existing nozzle_diameter subscription
+            sub.update({name: ["nozzle_diameter"]
+                        for name in self._extruder_subscription})
+            result = await kapis.subscribe_objects(
+                sub, self._klippy_status_update)
+            if result is not None:
+                self._update_msm_from_status(result)
+                self._update_nozzle_from_status(result)
+        except self.server.error:
+            logging.info("Error subscribing to machine_state_manager")
+        except Exception:
+            logging.exception("Failed to update from klippy")
+
+    def _update_nozzle_from_status(self, status: Dict[str, Any]) -> None:
+        """Update nozzle_diameter from klippy status data."""
+        updated = False
+        nozzle_list = list(self._last_nozzle_diameter)
+        for name, idx in self._extruder_subscription.items():
+            nozzle_d = status.get(name, {}).get("nozzle_diameter")
+            if nozzle_d is not None and nozzle_d != nozzle_list[idx]:
+                nozzle_list[idx] = nozzle_d
+                logging.info(f"Nozzle diameter for {name}: {nozzle_d}")
+                updated = True
+        if updated:
+            self._last_nozzle_diameter = nozzle_list
+            self._save_nozzle_diameter(nozzle_list)
+
+    def _update_msm_from_status(self, status: Dict[str, Any]) -> None:
+        """Update machine_state_manager cache from klippy status data."""
+        msm_data = status.get("machine_state_manager", {})
+        if msm_data:
+            self._msm_status.update(msm_data)
+            logging.info(f"machine state: {self._msm_status}")
+
+    def _save_nozzle_diameter(self, nozzle_diameter_list: List[float]) -> None:
+        """Save nozzle_diameter to product_info and file."""
+        self.product_info["nozzle_diameter"] = nozzle_diameter_list
+        self.system_info["product_info"] = self.product_info
+        try:
+            self.product_info_path.write_text(
+                json.dumps(self.product_info, indent='\t'))
+            logging.info(f"Updated nozzle_diameter: {nozzle_diameter_list}")
+        except Exception as e:
+            logging.error(f"Failed to save nozzle_diameter: {e}")
+
+    async def _klippy_status_update(
+        self, data: Dict[str, Any], _: float
+    ) -> None:
+        """Handle status updates from klippy subscription."""
+        if data:
+            self._update_msm_from_status(data)
+            self._update_nozzle_from_status(data)
 
     async def _show_product_info(self):
         # show product info on klippy startup
@@ -1053,6 +1125,14 @@ class Machine:
         return {
             "state": "success"
         }
+
+    async def _handle_heartbeat(self,
+                                    web_request: WebRequest
+                                    ) -> Dict[str, Any]:
+        # put keys&values of self._msm_status to res
+        res = self._msm_status.copy()
+        res["version"] = self.product_info.get("firmware_version", "0.0.0")
+        return res
 
     def get_device_name(self) -> str:
         return self.product_info.get("device_name", MACHINE_TYPE)

@@ -64,7 +64,7 @@ WATCH_FLAGS = iFlags.CREATE | iFlags.DELETE | iFlags.MODIFY \
 # 1400MB reserved for other functions
 # user still has announced space after reserved
 RESERVED_USER_SPACE = 1400 * 1024 * 1024
-OEM_SPACE = 100 * 1024 * 1024
+OEM_PATH = "/oem"
 USER_DATA_PATH = "/userdata"
 USB_MOUNT_PARENT="/mnt"
 USB_MOUNT_POINT="/mnt/udisk"
@@ -823,12 +823,13 @@ class FileManager:
                 'total': total,
                 'used': used
             }
-            flist['disk_usage'] = disk_usage
         else:
+            free, total = self.get_oem_space()
+            used = total - free
             disk_usage = {
-                'free': 0,
-                'total': OEM_SPACE,
-                'used': OEM_SPACE
+                'free': free,
+                'total': total,
+                'used': used
             }
         flist['disk_usage'] = disk_usage
         flist['root_info'] = {
@@ -893,6 +894,18 @@ class FileManager:
             return free_space, total_space
         except Exception as e:
             logging.error(f"Failed to get free space for {USER_DATA_PATH}: {e}")
+            return 0, 0
+
+    def get_oem_space(self) -> Any:
+        """Get the total & free space in MiB for the "/oem" path."""
+        try:
+            statvfs = os.statvfs(OEM_PATH)
+            free_space = statvfs.f_frsize * statvfs.f_bavail
+            total_space = statvfs.f_frsize * statvfs.f_blocks
+
+            return free_space, total_space
+        except Exception as e:
+            logging.error(f"Failed to get free space for {OEM_PATH}: {e}")
             return 0, 0
 
     def check_gcodes_space(self, required_space: int) -> bool:

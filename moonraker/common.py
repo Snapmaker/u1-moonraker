@@ -52,6 +52,7 @@ if TYPE_CHECKING:
 
 _T = TypeVar("_T")
 ENDPOINT_PREFIXES = ["printer", "server", "machine", "access", "api", "debug"]
+EFFECTIVE_REQ_DURATION = 600
 
 class ExtendedFlag(Flag):
     @classmethod
@@ -745,7 +746,7 @@ class JsonRPC:
                 data = data.decode()
             msg = f"{transport_type} data not valid json: {data}"
             logging.exception(msg)
-            err = self.build_error(-32700, "Parse error")
+            err = self.build_error(-32700, "Parse error", 0, 0)
             return jsonw.dumps(err)
         if isinstance(obj, list):
             responses: List[Dict[str, Any]] = []
@@ -771,39 +772,55 @@ class JsonRPC:
         transport: APITransport
     ) -> Optional[Dict[str, Any]]:
         req_id: Optional[int] = obj.get('id', None)
+        cli_time: Optional[int] = obj.get('cli_time', -1)
+        # device time on client
+        cli_dev_time: Optional[int] = obj.get('dev_time', -1)
+        current_time = int(time.time())
+        if cli_dev_time > 0:
+            if abs(current_time - cli_dev_time) > EFFECTIVE_REQ_DURATION:
+                return self.build_error(-31000, \
+                    "Message expired,dev-t:{},cli-dev-t:{},cli-t:{}".format( \
+                                                        current_time, \
+                                                        cli_dev_time, \
+                                                        cli_time
+                                                    ), \
+                    req_id, \
+                    cli_time \
+                )
         rpc_version: str = obj.get('jsonrpc', "")
         if rpc_version != "2.0":
-            return self.build_error(-32600, "Invalid Request", req_id)
+            return self.build_error(-32600, "Invalid Request", req_id, cli_time)
         method_name = obj.get('method', Sentinel.MISSING)
         if method_name is Sentinel.MISSING:
             self.process_response(obj, transport)
             return None
         if not isinstance(method_name, str):
             return self.build_error(
-                -32600, "Invalid Request", req_id, method_name=str(method_name)
+                -32600, "Invalid Request", req_id, cli_time, method_name=str(method_name)
             )
         method_info = self.methods.get(method_name, None)
         if method_info is None:
             return self.build_error(
-                -32601, "Method not found", req_id, method_name=method_name
+                -32601, "Method not found", req_id, cli_time, method_name=method_name
             )
         request_type, api_definition = method_info
         transport_type = transport.transport_type
         if transport_type not in api_definition.transports:
             return self.build_error(
                 -32601, f"Method not found for transport {transport_type.name}",
-                req_id, method_name=method_name
+                req_id, cli_time,
+                method_name=method_name
             )
         params: Dict[str, Any] = {}
         if 'params' in obj:
             params = obj['params']
             if not isinstance(params, dict):
                 return self.build_error(
-                    -32602, "Invalid params:", req_id, method_name=method_name
+                    -32602, "Invalid params:", req_id, cli_time, method_name=method_name
                 )
         params['req_id'] = req_id
         return await self.execute_method(
-            method_name, request_type, api_definition, req_id, transport, params
+            method_name, request_type, api_definition, req_id, transport, params, cli_time
         )
 
     def process_response(
@@ -838,7 +855,8 @@ class JsonRPC:
         api_definition: APIDefinition,
         req_id: Optional[int],
         transport: APITransport,
-        params: Dict[str, Any]
+        params: Dict[str, Any],
+        cli_time: Optional[int]
     ) -> Optional[Dict[str, Any]]:
         try:
             transport.screen_rpc_request(api_definition, request_type, params)
@@ -847,7 +865,7 @@ class JsonRPC:
             )
         except TypeError as e:
             return self.build_error(
-                -32602, f"Invalid params:\n{e}", req_id, True, method_name
+                -32602, f"Invalid params:\n{e}", req_id, cli_time, True, method_name
             )
         except ServerError as e:
             code = e.status_code
@@ -855,22 +873,24 @@ class JsonRPC:
                 code = -32601
             elif code == 401:
                 code = -32602
-            return self.build_error(code, str(e), req_id, True, method_name)
+            return self.build_error(code, str(e), req_id, cli_time, True, method_name)
         except Exception as e:
-            return self.build_error(-31000, str(e), req_id, True, method_name)
+            return self.build_error(-31000, str(e), req_id, cli_time, True, method_name)
 
         if req_id is None:
             return None
         elif result is None:
             return None
         else:
-            return self.build_result(result, req_id)
+            return self.build_result(result, req_id, cli_time)
 
-    def build_result(self, result: Any, req_id: int) -> Dict[str, Any]:
+    def build_result(self, result: Any, req_id: int, cli_time: int = -1) -> Dict[str, Any]:
         return {
             'jsonrpc': "2.0",
             'result': result,
-            'id': req_id
+            'id': req_id,
+            'cli_time': cli_time,
+            'dev_time': int(time.time())
         }
 
     def build_error(
@@ -878,6 +898,7 @@ class JsonRPC:
         code: int,
         msg: str,
         req_id: Optional[int] = None,
+        cli_time: int = 0,
         is_exc: bool = False,
         method_name: str = ""
     ) -> Dict[str, Any]:
@@ -891,7 +912,9 @@ class JsonRPC:
         return {
             'jsonrpc': "2.0",
             'error': {'code': code, 'message': msg},
-            'id': req_id
+            'id': req_id,
+            'cli_time': cli_time,
+            'dev_time': int(time.time())
         }
 
 

@@ -13,6 +13,7 @@ import pathlib, random
 import hashlib, shutil
 import logging.handlers
 import fcntl, select, re
+import datetime
 from queue import SimpleQueue
 from ..loghelper import LocalQueueHandler
 from ..common import RequestType, JobEvent, KlippyState, UserInfo, WebRequest, TransportType
@@ -135,7 +136,11 @@ class SnapmakerCloud:
             transports=(TransportType.all() & ~TransportType.HTTP)
         )
         self.server.register_endpoint(
-            "/server/files/start_print", RequestType.POST, self._handle_start_cloud_print,
+            "/server/files/start_local_print", RequestType.POST, self._handle_start_local_print,
+            transports=(TransportType.all() & ~TransportType.HTTP)
+        )
+        self.server.register_endpoint(
+            "/server/files/start_cloud_print", RequestType.POST, self._handle_start_cloud_print,
             transports=(TransportType.all() & ~TransportType.HTTP)
         )
         self.server.register_endpoint(
@@ -198,22 +203,61 @@ class SnapmakerCloud:
                                    ) -> Dict[str, Any]:
         return await self.print_handler.get_status()
 
+
+
+    async def _handle_start_local_print(self,
+                                   web_request: WebRequest
+                                   ) -> Dict[str, Any]:
+        try:
+            file_path: str = web_request.get_str("path")
+            options = web_request.get("options", None)
+            print_plate = web_request.get_int("print_plate", 1)
+
+            if not file_path:
+                return {"state": "error", "message": "path parameter is required"}
+
+            if options is not None and not isinstance(options, dict):
+                return {"state": "error", "message": "options must be a dictionary"}
+
+            logging.info(f"start_local_print: path={file_path}, "
+                        f"options={options}, print_plate={print_plate}")
+
+            return await self.print_handler.process_local_file(
+                file_path=file_path,
+                options=options,
+                print_plate=print_plate
+            )
+        except Exception as e:
+            logging.exception(f"start_local_print error: {e}")
+            return {"state": "error", "message": f"Exception: {e}"}
+
     async def _handle_start_cloud_print(self,
                                    web_request: WebRequest
                                    ) -> Dict[str, Any]:
-        """Handle start print request."""
-        url: str = web_request.get_str("url")
-        checksum = web_request.get_str("checksum", None)
-        file_size = web_request.get_int("size", 0)
-        file_type = web_request.get_str("type", None)
-        logging.info(f"cloud print: url: file_size:{file_size}, checksum: {checksum}, type: {file_type}")
-        free_space, _ = self.fm.get_user_space()
-        if file_size > free_space:
-            logging.error(f"not enough space for file {file_size} > {free_space}")
-            return {'state': 'error', 'message': 'not enough space for file'}
-        commands = web_request.get_list("commands", [])
+        try:
+            url: str = web_request.get_str("url")
+            auto_start = web_request.get_boolean("auto_start", False)
+            checksum = web_request.get_str("checksum", None)
+            filetype = web_request.get_str("type", None)
+            # default file size: 500MB
+            filesize = web_request.get_int("size", 0x1F400000)
+            free_space, total_space = self.fm.get_user_space()
+            print_plate = web_request.get_int("print_plate", 1)
+            options = web_request.get("options", None)
+            logging.info(f"free_space: {free_space}, total_space: {total_space}")
+            if free_space <= 0 or filesize > free_space:
+                logging.error(f"not enough space for file {filesize} > {free_space}")
+                return {'state': 'error', 'message': 'not enough space for file'}
 
-        return await self.print_handler.handle_cloud_print(url, commands, checksum, file_type)
+            logging.info(f"start:{auto_start}, checksum: {checksum}, "
+                            f"type: {filetype}, size: {filesize}, print_plate: {print_plate}, options: {options}")
+            return await self.print_handler.download_file(url, auto_start, checksum, filetype, print_plate, options)
+        except Exception as e:
+            logging.error(f"{e}")
+            return {
+                "state": "error",
+                "message": "exception: {}".format(e)
+            }
 
     async def _handle_pull_file(self,
                                 web_request: WebRequest
@@ -232,9 +276,6 @@ class SnapmakerCloud:
                 logging.error(f"not enough space for file {filesize} > {free_space}")
                 return {'state': 'error', 'message': 'not enough space for file'}
 
-            if auto_start:
-                if not await self.print_handler.check_can_print():
-                    return {"state": "busy", "message": "printer is busy"}
             logging.info(f"pull file: start:{auto_start}, checksum: {checksum}, \
                             type: {filetype}, size: {filesize}, print_plate: {print_plate}")
             return await self.print_handler.download_file(url, auto_start, checksum, filetype, print_plate)
@@ -594,11 +635,10 @@ class SnapmakerCloud:
                 # show exception info:
                 logging.debug(f"exception: {id} {index} {level} {code}")
                 job_state = ''.join([job_state, '-', str(level), '-', str(id), '-', str(index), '-', str(code)])
-
         notification = {
             "state": job_state,
             "filename": new_stats.get("filename", ""),
-            "timestamp": time.time()
+            "timestamp": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
         }
         logging.info(f"state: {state}, job notification: {notification}")
         self.mqtt.publish_notification("notify_device_state_changed", notification)
@@ -745,7 +785,7 @@ class PrintHandler:
             event['message'] = message
         event['path'] = self.download_file_name
         event['auto_start'] = self.auto_start
-        logging.info(f"notify_download_event: {event}")
+        logging.info(f"notify_download_state: {event}")
         self.server.send_event("smcloud:file_pull_progress", event)
 
     async def _reset_download_state(self) -> None:
@@ -754,7 +794,7 @@ class PrintHandler:
             self.auto_start = False
             self.download_file_name = ""
             self.download_progress = -1
-        logging.info("reset_download_state")
+        logging.debug("reset_download_state")
 
     async def get_status(self) -> Dict[str, Any]:
         status = {"state": self.download_state}
@@ -775,11 +815,17 @@ class PrintHandler:
 
     async def download_file(self, url: str, start: bool,
                             checksum: str, filetype: str,
-                            print_plate: int) -> Dict[str, Any]:
+                            print_plate: int,
+                            options: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         url_path = urlparse(url)
         target_file = pathlib.Path(unquote(url_path.path))
         fm: FileManager = self.server.lookup_component("file_manager")
         gc_path = pathlib.Path(fm.get_directory())
+
+        if start:
+            if not await self.check_can_print():
+                return {"state": "busy", "message": "printer is busy"}
+
         if not gc_path.is_dir():
             logging.warning(f"GCode Path Not Registered: {gc_path}")
             return {"state": "error", "message": "GCode Path not Registered"}
@@ -790,6 +836,7 @@ class PrintHandler:
             return {"state": "error", "message": "Invalid URL: {}".format(url)}
         try:
             # check file path is in used or not
+            logging.info(f"check file path: {target_path}")
             fm._handle_operation_check(str(target_path))
         except Exception as e:
             logging.warning(f"File Operation Check Failed: {e}")
@@ -804,10 +851,130 @@ class PrintHandler:
             self.download_file_name = target_file.name
             self.auto_start = start
             self.download_time = 0
-
-        coro = self._download_sm_file(url, start, checksum, filetype, print_plate)
+        if options is None:
+            coro = self._download_sm_file(url, start, checksum, filetype, print_plate)
+        else:
+            coro = self._start_cloud_print_async(url, start, checksum, filetype, print_plate, gc_path, options)
         self.download_task = self.eventloop.create_task(coro)
         return {"state": "success"}
+
+    async def _download_and_process_file(
+        self,
+        url: str,
+        checksum: Optional[str],
+        filetype: str,
+        print_plate: int,
+        gc_path: pathlib.Path,
+        target_file: pathlib.Path
+    ) -> Optional[str]:
+        state = "ready"
+        message = ""
+        tmp_path = ""
+        client: HttpxClient = self.server.lookup_component("httpx_client")
+        filename = pathlib.PurePath(target_file.name)
+        accept = "text/plain,applicaton/octet-stream"
+
+        auth_url = await self._authorize_download_url(url)
+        if len(auth_url) < 10:
+            state = "error"
+            message = f"invalid URL: {auth_url}"
+            self._notify_download_state(state, message)
+            await self._reset_download_state()
+            return None
+
+        self._on_download_progress(0, 0, 0)
+
+        try:
+            tmp_path = await client.download_file(
+                auth_url, accept,
+                progress_callback=self._on_download_progress,
+                connect_timeout=10.,
+                request_timeout=30.,
+                attempts=3,
+                destination_path=self.fm.gen_temp_upload_path()
+            )
+        except asyncio.TimeoutError:
+            state = "timeout"
+            message = "Timeout to download file"
+            logging.error(f"timeout to download file: {filename}")
+        except asyncio.CancelledError:
+            state = "cancel"
+            message = "Download was cancelled"
+            logging.info(f"download cancelled: {filename}")
+        except Exception as e:
+            state = "error"
+            message = f"Failed to download file"
+            logging.error(f"Failed to download file: {filename}, error: {e}")
+        finally:
+            self.download_time = 0.0
+            if state != "ready":
+                self._notify_download_state(state, message)
+                if tmp_path and os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+                return None
+
+        logging.debug("SnapmakerCloud: Download Complete")
+        calc = await self._get_file_hash(tmp_path)
+        logging.info("calc file checksum: {}".format(calc))
+
+        if checksum is not None:
+            if calc is None or calc != checksum:
+                logging.error("calc checksum[{}] != recv checksum[{}], remove downfile!".format(calc, checksum))
+                self._notify_download_state("check_error", "checksum error")
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+                return None
+            else:
+                logging.info("checksum pass")
+        else:
+            logging.warning(f"client didn't provide checksum")
+
+        fpath = gc_path.joinpath(filename.name)
+        try:
+            self.fm._handle_operation_check(str(fpath))
+        except Exception as e:
+            logging.error(f"File operation check failed for {fpath}: {e}")
+            self._notify_download_state("file_in_use", "file in use")
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+            return None
+
+        shutil.move(tmp_path, fpath)
+        return fpath
+
+    async def _start_cloud_print_async(
+        self,
+        url: str,
+        start: bool,
+        checksum: Optional[str],
+        filetype: str,
+        print_plate: int,
+        gc_path: pathlib.Path,
+        options: Optional[Dict[str, Any]] = None
+    ) -> None:
+        try:
+            url_path = urlparse(url)
+            target_file = pathlib.Path(unquote(url_path.path))
+            fm: FileManager = self.server.lookup_component("file_manager")
+
+            gcode_filename = await self._download_and_process_file(url, checksum, filetype, print_plate, gc_path, target_file)
+            if gcode_filename is None:
+                logging.error(f"download file failed: {url}")
+                return None
+
+            if not gcode_filename.exists():
+                logging.error(f"downloaded file not found: {gcode_filename}")
+                self._notify_download_state("error", f"Downloaded file not found: {gcode_filename.name}")
+                return None
+
+            await self.process_local_file(str(gcode_filename), start, options, print_plate, True)
+            return None
+        except Exception as e:
+            self._notify_download_state("error", f"start cloud print failed: {e}")
+            logging.error(f"start cloud print failed: {e}")
+            return None
+        finally:
+            await self._reset_download_state()
 
     async def cancel(self):
         if self.download_task is None:
@@ -1073,6 +1240,12 @@ class PrintHandler:
                         shutil.move(str(local_png_path), str(new_png_path))
 
                 final_3mf_path = gcode_path / name_3mf.name
+                try:
+                    self.fm._handle_operation_check(str(final_3mf_path))
+                except Exception as e:
+                    logging.error(f"File operation check failed for {final_3mf_path}: {e}")
+                    self._cleanup_3mf_temp_files(tmpdir_path, plates, plates_md5, top_thumbs)
+                    return None
                 shutil.move(str(tmp_path), str(final_3mf_path))
 
                 self._cleanup_3mf_temp_files(tmpdir_path, plates, plates_md5, top_thumbs)
@@ -1304,22 +1477,160 @@ class PrintHandler:
         return gcode_file_path
 
     async def start_print(self) -> None:
-        if not self.pending_file:
-            return
-        pending = self.pending_file
-        self.pending_file = ""
-        kapi: KlippyAPI = self.server.lookup_component("klippy_apis")
-        data = {"state": "started"}
-        try:
-            await kapi.start_print(pending, user=self.sp_user)
-        except Exception:
-            logging.exception("Print Failed to start")
-            data["state"] = "error"
-            data["message"] = "Failed to start print"
-            data["path"] = pending
+        pass
+
+    async def process_local_file(
+        self,
+        file_path: str,
+        auto_start: bool = True,
+        options: Optional[Dict[str, Any]] = None,
+        print_plate: int = 1,
+        from_cloud: bool = False
+    ) -> Dict[str, Any]:
+        fm: FileManager = self.server.lookup_component("file_manager")
+        gc_path = pathlib.Path(fm.get_directory())
+
+        if not gc_path.is_dir():
+            if from_cloud:
+                self._notify_download_state("error", "GCode Path not Registered")
+            logging.error(f"GCode Path Not Registered: {gc_path}")
+            return {"state": "error", "message": "GCode Path not Registered"}
+
+        full_path = gc_path / file_path
+        if not full_path.exists():
+            if from_cloud:
+                self._notify_download_state("error", f"File not found: {file_path}")
+            logging.error(f"File not found: {full_path}")
+            return {"state": "error", "message": f"File not found: {file_path}"}
+
+        file_ext = full_path.suffix.lower()
+
+        if file_ext == '.gcode':
+            return await self._process_gcode_file(full_path, file_path, auto_start, options, from_cloud)
+        elif file_ext == '.zip':
+            return await self._process_zip_file(full_path, gc_path, auto_start, options, print_plate, from_cloud)
+        elif file_ext == '.3mf':
+            return await self._process_3mf_file(full_path, gc_path, auto_start, options, print_plate, from_cloud)
         else:
-            self.last_started = pending
-        self.server.send_event("smcloud:file_pull_progress", data)
+            logging.error(f"Unsupported file type: {file_ext}")
+            if from_cloud:
+                self._notify_download_state("error", "Unsupported file type")
+            return {"state": "error", "message": f"Unsupported file type: {file_ext}"}
+
+    async def _process_gcode_file(
+        self,
+        full_path: pathlib.Path,
+        relative_path: str,
+        auto_start: bool,
+        options: Optional[Dict[str, Any]] = None,
+        from_cloud: bool = False
+    ) -> Dict[str, Any]:
+        try:
+            self.fm._handle_operation_check(str(full_path))
+        except Exception as e:
+            if from_cloud:
+                self._notify_download_state("file_in_use", f"File is in use: {e}")
+            logging.error(f"File operation check failed: {e}")
+            return {"state": "error", "message": f"File is in use: {e}"}
+
+        if auto_start:
+            if not await self.check_can_print():
+                if from_cloud:
+                    self._notify_download_state("busy", "Printer is busy, cannot start print")
+                logging.error("Printer is busy, cannot start print")
+                return {"state": "error", "message": "Printer is busy, cannot start print"}
+
+            metadata = self.fm.gcode_metadata.get(relative_path, None)
+            if metadata is None:
+                logging.debug(f"Metadata not found for {relative_path}, checking scan status")
+                if self.fm.gcode_metadata.is_file_processing(relative_path):
+                    logging.debug(f"Metadata scan in progress for {relative_path}, waiting...")
+                    while self.fm.gcode_metadata.is_file_processing(relative_path):
+                        await asyncio.sleep(0.1)
+                    metadata = self.fm.gcode_metadata.get(relative_path, None)
+                else:
+                    logging.info(f"Starting metadata scan for {relative_path}")
+                    try:
+                        path_info = self.fm.get_path_info(str(full_path), "gcodes")
+                    except Exception as e:
+                        if from_cloud:
+                            self._notify_download_state("error", f"Failed to get file info: {e}")
+                        logging.error(f"Failed to get path info for {relative_path}: {e}")
+                        return {"state": "error", "message": f"Failed to get file info: {e}"}
+
+                    scan_event = self.fm.gcode_metadata.parse_metadata(relative_path, path_info)
+                    await scan_event.wait()
+                    metadata = self.fm.gcode_metadata.get(relative_path, None)
+                    if metadata is None:
+                        logging.warning(f"Metadata scan completed but no metadata found for {relative_path}")
+                        if from_cloud:
+                            self._notify_download_state("error", "Failed to parse file metadata")
+                        return {"state": "error", "message": "Failed to parse file metadata"}
+
+            kapi: KlippyAPI = self.server.lookup_component("klippy_apis")
+            try:
+                await kapi.start_print_advanced(relative_path, True, options=options)
+                if from_cloud:
+                    self._notify_download_state("ready", "Print started")
+                return {"state": "success", "message": "Print started", "filename": relative_path}
+            except Exception as e:
+                if from_cloud:
+                    self._notify_download_state("error", f"Failed to start print: {e}")
+                logging.error(f"Failed to start print: {e}")
+                return {"state": "error", "message": f"Failed to start print: {e}"}
+
+        if from_cloud:
+            self._notify_download_state("ready", "File ready")
+        return {"state": "success", "message": "File ready", "filename": relative_path}
+
+    async def _process_zip_file(
+        self,
+        zip_path: pathlib.Path,
+        gc_path: pathlib.Path,
+        auto_start: bool,
+        options: Optional[Dict[str, Any]] = None,
+        print_plate: int = 1,
+        from_cloud: bool = False
+    ) -> Dict[str, Any]:
+        if from_cloud:
+            self._notify_download_state("extracting", "extracting file")
+        gcode_path = await self._extract_gcode_from_zip(zip_path, gc_path)
+        if gcode_path is None:
+            if from_cloud:
+                self._notify_download_state("extract_error", "extracting file failed")
+            return {"state": "error", "message": "Failed to extract gcode from zip"}
+
+        try:
+            relative_path = gcode_path.name
+            return await self._process_gcode_file(gcode_path, relative_path, auto_start, options, from_cloud)
+        finally:
+            if zip_path.exists():
+                zip_path.unlink()
+
+    async def _process_3mf_file(
+        self,
+        threemf_path: pathlib.Path,
+        gc_path: pathlib.Path,
+        auto_start: bool,
+        options: Optional[Dict[str, Any]] = None,
+        print_plate: int = 1,
+        from_cloud: bool = False
+    ) -> Dict[str, Any]:
+        if from_cloud:
+            self._notify_download_state("extracting", "extracting file")
+        gcode_name = await self._handle_3mf(threemf_path, gc_path, threemf_path, print_plate)
+        if gcode_name is None:
+            if from_cloud:
+                self._notify_download_state("extract_error", "extracting file failed")
+            return {"state": "error", "message": "Failed to extract gcode from 3mf"}
+
+        gcode_path = gc_path / gcode_name
+        if not gcode_path.exists():
+            if from_cloud:
+                self._notify_download_state("error", f"Gcode file not found: {gcode_name}")
+            return {"state": "error", "message": f"Gcode file not found: {gcode_name}"}
+
+        return await self._process_gcode_file(gcode_path, gcode_name, auto_start, options, from_cloud)
 
     async def check_can_print(self) -> bool:
         kconn: KlippyConnection = self.server.lookup_component("klippy_connection")
@@ -1375,20 +1686,6 @@ class PrintHandler:
             return await event_loop.run_in_thread(hash_func, filename)
         except Exception:
             return None
-
-    async def handle_cloud_print(self, url, commands, checksum, file_type) -> Dict[str, Any]:
-        job_state: JobState = self.server.lookup_component("job_state")
-        last_stats = job_state.get_last_stats()
-        state: str = last_stats.get('state', "")
-        kconn: KlippyConnection
-        kconn = self.server.lookup_component("klippy_connection")
-        if not kconn.is_ready() or state in ["printing", "paused"]:
-            return {"state": "error", "message": "Klippy not ready or print in progress"}
-        if self.download_task is not None and not self.download_task.done():
-            return {"state": "error", "message": "A file is already being downloaded"}
-        coro = self._download_sm_file(url, True, checksum, file_type, commands=commands)
-        self.download_task = self.eventloop.create_task(coro)
-        return {"state": "success"}
 
 def load_component(config: ConfigHelper) -> SnapmakerCloud:
     return SnapmakerCloud(config)
