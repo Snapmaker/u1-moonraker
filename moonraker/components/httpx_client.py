@@ -50,6 +50,7 @@ class HttpxClient:
         self.client = httpx.AsyncClient(
             headers={"User-Agent": "Moonraker"},
             follow_redirects=True,
+            verify=False,
         )
         self.response_cache: Dict[str, HttpResponse] = {}
 

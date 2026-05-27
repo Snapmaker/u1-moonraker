@@ -6,6 +6,9 @@
 
 from __future__ import annotations
 import logging
+import hashlib
+import pathlib
+import time
 from ..utils import Sentinel
 from ..common import WebRequest, APITransport, RequestType, TransportType, KlippyState
 
@@ -309,6 +312,34 @@ class KlippyAPI(APITransport):
             logging.info("No metadata to add to script")
         return script
 
+    @staticmethod
+    def _calc_file_md5(file_path: pathlib.Path) -> tuple[str, int, float]:
+        md5 = hashlib.md5()
+        file_size = 0
+        start_time = time.time()
+        with open(file_path, 'rb') as f:
+            for chunk in iter(lambda: f.read(8192), b''):
+                md5.update(chunk)
+                file_size += len(chunk)
+        elapsed = time.time() - start_time
+        return md5.hexdigest(), file_size, elapsed
+
+    async def _log_file_md5(self, filename: str) -> None:
+        try:
+            fm = self.server.lookup_component("file_manager")
+            gc_path = pathlib.Path(fm.get_directory("gcodes"))
+            file_path = gc_path / filename
+            if not file_path.is_file():
+                logging.warning(f"Print file not found for MD5: {file_path}")
+                return
+            md5_str, file_size, elapsed = await self.eventloop.run_in_thread(
+                self._calc_file_md5, file_path)
+            logging.info(
+                f"Print file MD5: filename={filename}, md5={md5_str}, "
+                f"size={file_size}, elapsed={elapsed:.3f}s")
+        except Exception:
+            logging.exception(f"Failed to calculate MD5 for {filename}")
+
     async def start_print_advanced(
         self,
         filename: str,
@@ -325,6 +356,7 @@ class KlippyAPI(APITransport):
             raise ValueError("filename cannot be empty")
         if filename[0] == '/':
             filename = filename[1:]
+        self.eventloop.create_task(self._log_file_md5(filename))
         # Escape existing double quotes in the file name
         filename = filename.replace("\"", "\\\"")
         fm = self.server.lookup_component("file_manager")
@@ -356,6 +388,7 @@ class KlippyAPI(APITransport):
         # XXX - validate that file is on disk
         if filename[0] == '/':
             filename = filename[1:]
+        self.eventloop.create_task(self._log_file_md5(filename))
         # Escape existing double quotes in the file name
         filename = filename.replace("\"", "\\\"")
         script = f'SDCARD_PRINT_FILE FILENAME="{filename}"'
