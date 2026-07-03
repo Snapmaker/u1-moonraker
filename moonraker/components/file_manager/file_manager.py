@@ -18,7 +18,7 @@ import math
 from copy import deepcopy
 from inotify_simple import INotify
 from inotify_simple import flags as iFlags
-from ...utils import source_info
+from ...utils import source_info, open_sync_file
 from ...utils import json_wrapper as jsonw
 from ...common import RequestType, TransportType
 
@@ -71,7 +71,6 @@ USB_MOUNT_POINT="/mnt/udisk"
 USB_GCODE_DIR=".udisk"
 BUILT_IN_GCODE_DIR="/home/lava/origin_printer_data/builtin_gcodes"
 FACTORY_RESET_FLAG=".factory_reset"
-TMP_GCODE_DIR = "/userdata/.tmp_gcodes"
 
 class FileManager:
     def __init__(self, config: ConfigHelper) -> None:
@@ -232,7 +231,8 @@ class FileManager:
         if gcodes_path:
             gcodes_path = pathlib.Path(gcodes_path)
             fact_reset_flag = gcodes_path / FACTORY_RESET_FLAG
-            fact_reset_flag.touch(exist_ok=True)
+            with open_sync_file(str(fact_reset_flag), 'a'):
+                pass  # touch the flag file with O_SYNC
 
     def _update_fixed_paths(self) -> None:
         kinfo = self.server.get_klippy_info()
@@ -874,7 +874,7 @@ class FileManager:
     def gen_temp_upload_path(self) -> str:
         loop_time = int(self.event_loop.get_loop_time())
         return os.path.join(
-            TMP_GCODE_DIR,
+            tempfile.gettempdir(),
             f"moonraker.upload-{loop_time}.mru")
 
     def get_user_space(self) -> Any:

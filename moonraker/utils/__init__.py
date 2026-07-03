@@ -275,3 +275,51 @@ def parse_ip_address(address: str) -> Optional[IPAddress]:
         return ipaddress.ip_address(address)
     except Exception:
         return None
+
+
+def open_sync_file(path: Union[str, pathlib.Path], mode: str = 'w',
+                   encoding: Optional[str] = None,
+                   errors: Optional[str] = None):
+    """Open a file in synchronous I/O mode (O_SYNC).
+
+    Each write system call is synchronous — data is written
+    to disk before the call returns.  Use this for configuration
+    files and other persistent state that must survive a sudden
+    power loss.
+
+    Args:
+        path: File path (str or pathlib.Path).
+        mode: Open mode ('w', 'a', 'wb', …).
+        encoding: Text encoding (text modes only).
+        errors: Error handling (text modes only).
+    """
+    flags = os.O_SYNC
+    if 'w' in mode:
+        flags |= os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    elif 'a' in mode:
+        flags |= os.O_WRONLY | os.O_CREAT | os.O_APPEND
+    elif 'x' in mode:
+        flags |= os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    fd = os.open(str(path), flags)
+    # Strip 't' but keep 'b' — binary mode doesn't accept encoding
+    fd_mode = mode.replace('t', '')
+    kwargs: Dict[str, Any] = {}
+    if 'b' not in mode:
+        if encoding is not None:
+            kwargs['encoding'] = encoding
+        if errors is not None:
+            kwargs['errors'] = errors
+    return os.fdopen(fd, fd_mode, **kwargs)
+
+
+def write_text_sync(path: Union[str, pathlib.Path], data: str,
+                    encoding: str = 'utf-8',
+                    errors: Optional[str] = None) -> None:
+    """Write *data* to *path* using synchronous I/O (O_SYNC).
+
+    A drop-in replacement for ``pathlib.Path.write_text()`` that
+    guarantees the content hits disk before the call returns.
+    """
+    with open_sync_file(str(path), 'w', encoding=encoding,
+                        errors=errors) as f:
+        f.write(data)

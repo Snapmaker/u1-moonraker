@@ -17,7 +17,7 @@ import subprocess
 from queue import SimpleQueue
 from ..loghelper import LocalQueueHandler
 from ..common import RequestType, JobEvent, KlippyState, UserInfo, WebRequest, TransportType
-from ..utils import json_wrapper as jsonw
+from ..utils import json_wrapper as jsonw, open_sync_file
 from urllib.parse import urlparse
 from urllib.parse import unquote
 import glob, json
@@ -204,7 +204,7 @@ class ClientManager:
             try:
                 del self.oem_config['userid']
                 del self.oem_config['username']
-                with open(self.client_cfg_path, "w") as f:
+                with open_sync_file(self.client_cfg_path, "w") as f:
                     json.dump(self.oem_config, f, indent='\t')
                 logging.info(f"clean old config, now config: {self.oem_config}")
             except Exception as e:
@@ -230,7 +230,7 @@ class ClientManager:
         self.oem_config['region'] = ""
         if 'clients' in self.oem_config:
             del self.oem_config['clients']
-        with open(self.client_cfg_path, "w") as f:
+        with open_sync_file(self.client_cfg_path, "w") as f:
             json.dump(self.oem_config, f, indent='\t')
         logging.info("factory reset: reset oem config")
         # notify Agent to reset
@@ -338,7 +338,7 @@ class ClientManager:
                     logging_out_userid = ""
                     self.oem_config['logging_out_userid'] = ""
             if save:
-                with open(self.client_cfg_path, "w") as f:
+                with open_sync_file(self.client_cfg_path, "w") as f:
                     json.dump(self.oem_config, f, indent='\t')
         # if new userid is provided, check if logged out
         else:
@@ -367,7 +367,7 @@ class ClientManager:
                         logging_out_userid = ""
                         self.oem_config['logging_out_userid'] = ""
                 if save:
-                    with open(self.client_cfg_path, "w") as f:
+                    with open_sync_file(self.client_cfg_path, "w") as f:
                         json.dump(self.oem_config, f, indent='\t')
         if update_mdns:
             logging.info(f"notify mdns update, userid: {agent_userid}")
@@ -569,7 +569,8 @@ class ClientManager:
         try:
             # Create password file if not exists
             if not os.path.exists(password_file):
-                open(password_file, 'a').close()
+                with open_sync_file(password_file, 'a'):
+                    pass
                 os.chmod(password_file, 0o600)
 
             # Create account
@@ -618,7 +619,7 @@ class ClientManager:
 
             # cleanup the users.conf
             if os.path.exists(self.mqtt_users_conf):
-                with open(self.mqtt_users_conf, 'w') as file:
+                with open_sync_file(self.mqtt_users_conf, 'w'):
                     pass
             # re-generate certificate
             await self._generate_certificate("ca", "ca")
@@ -634,7 +635,7 @@ class ClientManager:
         # cleanup the oem_config
         if "clients" in self.oem_config:
             self.oem_config.pop("clients")
-            with open(self.client_cfg_path, "w", encoding="utf-8") as f:
+            with open_sync_file(self.client_cfg_path, "w", encoding="utf-8") as f:
                 json.dump(self.oem_config, f, indent='\t')
         await self._remove_local_mqtt_certs()
         # screen should restart /etc/init.d/S50mosquitto to disconnect original client
@@ -685,7 +686,7 @@ class ClientManager:
 
     async def _refresh_pin_code(self) -> Optional[str]:
         logging.info("request to refresh pin code")
-        retry = 6
+        retry = 3
         params = {}
         while retry > 0:
             retry -= 1
@@ -702,7 +703,7 @@ class ClientManager:
                                                     "mqtt_agent/response/moonraker_pin_code",
                                                     req_msg,
                                                     qos=1,
-                                                    timeout=10)
+                                                    timeout=25)
                 if resp is None:
                     await asyncio.sleep(2)
                     continue
@@ -793,7 +794,7 @@ class ClientManager:
                         userid = ""
                     else:
                         userid = self.userid
-                with open(self.client_cfg_path, "w", encoding="utf-8") as f:
+                with open_sync_file(self.client_cfg_path, "w", encoding="utf-8") as f:
                     json.dump(self.oem_config, f, indent='\t')
                 self._notify_client_link_mode({'link_mode': mode})
                 # notify MQTT clients the link mode has been changed
@@ -881,7 +882,7 @@ class ClientManager:
                 username = ""
                 logging.info("no user logged currently")
 
-        with open(self.client_cfg_path, "w", encoding="utf-8") as f:
+        with open_sync_file(self.client_cfg_path, "w", encoding="utf-8") as f:
             json.dump(self.oem_config, f, indent='\t')
 
         ret = await self._logout_user(userid, username, True)
@@ -912,7 +913,7 @@ class ClientManager:
         if not os.path.exists(self.client_cfg_path):
             logging.info(f"Creating new clients file: {self.client_cfg_path}")
             self.oem_config.update(defaults)
-            with open(self.client_cfg_path, "w", encoding="utf-8") as f:
+            with open_sync_file(self.client_cfg_path, "w", encoding="utf-8") as f:
                 json.dump(self.oem_config, f, indent='\t')
             # make sure to remove local MQTT users conf
             self._remove_local_mqtt_certs()
@@ -931,7 +932,7 @@ class ClientManager:
         if retry < 0:
             logging.info(f"Creating new clients file due to JSON error: {self.client_cfg_path}, resetting to defaults")
             self.oem_config.update(defaults)
-            with open(self.client_cfg_path, "w", encoding="utf-8") as f:
+            with open_sync_file(self.client_cfg_path, "w", encoding="utf-8") as f:
                 json.dump(self.oem_config, f, indent='\t')
             # make sure to remove local MQTT users conf
             self._remove_local_mqtt_certs()
@@ -952,7 +953,7 @@ class ClientManager:
 
         if need_write:
             logging.info(f"Updating clients file: {self.client_cfg_path}")
-            with open(self.client_cfg_path, "w", encoding="utf-8") as f:
+            with open_sync_file(self.client_cfg_path, "w", encoding="utf-8") as f:
                 json.dump(self.oem_config, f, indent='\t')
 
     async def _ack_authentication_request(self, result: Dict[str, Any], link_mode=LINK_MODE_LAN) -> None:
@@ -1022,7 +1023,7 @@ class ClientManager:
         acl_entry_path = "/etc/mosquitto/acl_entry.conf"
         try:
             # Clear the file and write new access code permissions
-            with open(acl_entry_path, "w") as f:
+            with open_sync_file(acl_entry_path, "w") as f:
                 if net_mode == self.LINK_MODE_CLOUD:
                     f.write("topic write cloud/config/request\n")
                     f.write("topic read cloud/config/response\n")
@@ -1081,7 +1082,7 @@ class ClientManager:
         # Record clientid in oem_config
         if "clients" not in self.oem_config:
             self.oem_config["clients"] = {}
-            with open(self.client_cfg_path, "w", encoding="utf-8") as f:
+            with open_sync_file(self.client_cfg_path, "w", encoding="utf-8") as f:
                 json.dump(self.oem_config, f, indent='\t')
 
         # Check if client already has credentials
@@ -1278,7 +1279,7 @@ class ClientManager:
                     else:
                         logging.info("no user logged currently")
                 self.oem_config['region'] = region
-                with open(self.client_cfg_path, "w", encoding="utf-8") as f:
+                with open_sync_file(self.client_cfg_path, "w", encoding="utf-8") as f:
                     json.dump(self.oem_config, f, indent='\t')
                 await self._sync_region_to_agent()
                 self.server.send_event("snapmaker:update_mdns_info", {'region': region, 'userid': ""})
@@ -1371,7 +1372,7 @@ class ClientManager:
             "key_path": key_path,
             "index": max_id + 1
         }
-        with open(self.client_cfg_path, "w", encoding="utf-8") as f:
+        with open_sync_file(self.client_cfg_path, "w", encoding="utf-8") as f:
             json.dump(self.oem_config, f, indent='\t')
 
         client_info = {

@@ -95,6 +95,7 @@ class KlippyConnection:
         self._state.set_message("Klippy Disconnected")
         self.subscriptions: Dict[APITransport, Subscription] = {}
         self.subscription_cache: Dict[str, Dict[str, Any]] = {}
+        self._last_eventtime: float = 0.0
         # Setup remote methods accessable to Klippy.  Note that all
         # registered remote methods should be of the notification type,
         # they do not return a response to Klippy after execution
@@ -637,6 +638,7 @@ class KlippyConnection:
     def _process_status_update(
         self, eventtime: float, status: Dict[str, Dict[str, Any]]
     ) -> None:
+        self._last_eventtime = eventtime
         for field, item in status.items():
             self.subscription_cache.setdefault(field, {}).update(item)
         if 'webhooks' in status:
@@ -706,6 +708,59 @@ class KlippyConnection:
                             all_subs[obj] = uitems
                     else:
                         all_subs[obj] = items
+            # Build the union of all existing subscriptions to check if all_subs
+            # is already fully covered, avoiding an unnecessary Klippy RPC.
+            existing_union: Subscription = {}
+            for sub in self.subscriptions.values():
+                for obj, items in sub.items():
+                    if obj not in existing_union:
+                        existing_union[obj] = items
+                    elif items is None or existing_union[obj] is None:
+                        # If any subscriber requests all fields, the union
+                        # must also request all fields (None).
+                        existing_union[obj] = None
+                    else:
+                        existing_union[obj] = list(
+                            set(existing_union[obj]) | set(items))
+            # Check if every object/field in all_subs is covered by existing
+            # subscriptions.  A None value means "all fields", so an existing
+            # None subscription covers any request for that object.
+            covered = True
+            for obj, fields in all_subs.items():
+                if obj not in existing_union:
+                    covered = False
+                    break
+                ex_fields = existing_union[obj]
+                if ex_fields is not None:
+                    if fields is None:
+                        covered = False
+                        break
+                    if not all(f in ex_fields for f in fields):
+                        covered = False
+                        break
+            # Guard against cold cache: every object the caller requested must
+            # already be present in the subscription cache.
+            missing_cache = False
+            for obj in requested_sub:
+                if obj not in self.subscription_cache:
+                    missing_cache = True
+                    break
+            if covered and not missing_cache:
+                # No new objects or fields need to be subscribed on Klippy's
+                # side.  Build the response directly from the cached status.
+                pruned_status: Dict[str, Dict[str, Any]] = {}
+                for obj, fields in requested_sub.items():
+                    cached = self.subscription_cache[obj]
+                    if fields is None:
+                        pruned_status[obj] = dict(cached)
+                    else:
+                        pruned_status[obj] = {
+                            k: v for k, v in cached.items() if k in fields}
+                self.subscriptions[conn] = requested_sub
+                return {
+                    'status': pruned_status,
+                    'eventtime': self._last_eventtime
+                }
             args['objects'] = all_subs
             args['response_template'] = {'method': "process_status_update"}
 

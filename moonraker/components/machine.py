@@ -22,7 +22,8 @@ import getpass
 import configparser
 import json
 from ..confighelper import FileSourceWrapper
-from ..utils import source_info, cansocket, sysfs_devs, load_system_module
+from ..utils import source_info, cansocket, sysfs_devs, load_system_module, \
+    open_sync_file, write_text_sync
 from ..utils import json_wrapper as jsonw
 from ..common import RequestType, KlippyState
 
@@ -253,8 +254,8 @@ class Machine:
         self.product_info["nozzle_diameter"] = nozzle_diameter_list
         self.system_info["product_info"] = self.product_info
         try:
-            self.product_info_path.write_text(
-                json.dumps(self.product_info, indent='\t'))
+            write_text_sync(self.product_info_path,
+                            json.dumps(self.product_info, indent='\t'))
             logging.info(f"Updated nozzle_diameter: {nozzle_diameter_list}")
         except Exception as e:
             logging.error(f"Failed to save nozzle_diameter: {e}")
@@ -282,7 +283,7 @@ class Machine:
         default_svcs = source_info.read_asset("default_allowed_services") or ""
         try:
             if not fpath.exists():
-                fpath.write_text(default_svcs)
+                write_text_sync(fpath, default_svcs)
             data = fpath.read_text()
         except Exception:
             logging.exception("Failed to read moonraker.asvc")
@@ -1055,7 +1056,8 @@ class Machine:
                     logging.info("No device name file found, using default value")
             except Exception as e:
                 logging.error(f"Failed to read device name: {e}")
-            self.product_info_path.write_text(json.dumps(self.product_info, indent='\t'))
+            write_text_sync(self.product_info_path,
+                            json.dumps(self.product_info, indent='\t'))
         else:
             try:
                 self.product_info = json.loads(self.product_info_path.read_text())
@@ -1063,7 +1065,8 @@ class Machine:
                 logging.error(
                     "Failed to read product info file, using default values"
                 )
-                self.product_info_path.write_text(json.dumps(product_info_default, indent='\t'))
+                write_text_sync(self.product_info_path,
+                                json.dumps(product_info_default, indent='\t'))
                 self.product_info = product_info_default
         # for now, firmware_version and software_version are same
         self.product_info["firmware_version"] = app_args.get("software_version", "0.0.0")
@@ -1099,7 +1102,8 @@ class Machine:
         logging.info(f'product info: {self.product_info}')
         if need_saved:
             try:
-                self.product_info_path.write_text(json.dumps(self.product_info, indent='\t'))
+                write_text_sync(self.product_info_path,
+                                json.dumps(self.product_info, indent='\t'))
             except Exception as e:
                 logging.error(f"Failed to save product info: {e}")
         return self.product_info
@@ -1120,7 +1124,8 @@ class Machine:
         self.system_info["product_info"] = self.product_info
         self.server.send_event("snapmaker:update_mdns_info", {'device_name': name})
         self.server.send_event("smcloud:devie_info_update", {'device_name': name})
-        self.product_info_path.write_text(json.dumps(self.product_info, indent='\t'))
+        write_text_sync(self.product_info_path,
+                        json.dumps(self.product_info, indent='\t'))
         logging.info(f'Device name set to {name}')
         return {
             "state": "success"
@@ -2076,14 +2081,13 @@ class InstallValidator:
             # This module isn't in site/dist packages,
             # add PYTHONPATH env variable
             env_vars["PYTHONPATH"] = str(src_path)
-        tmp_svc.write_text(
-            SYSTEMD_UNIT
-            % (SERVICE_VERSION, user, env_file, exec_path)
-        )
+        write_text_sync(tmp_svc,
+                        SYSTEMD_UNIT
+                        % (SERVICE_VERSION, user, env_file, exec_path))
         try:
             # write new environment
             envout = "\n".join(f"{key}=\"{val}\"" for key, val in env_vars.items())
-            env_file.write_text(envout)
+            write_text_sync(env_file, envout)
             await machine.exec_sudo_command(
                 f"cp -f {tmp_svc} {svc_dest}", tries=5, timeout=60.)
             await machine.exec_sudo_command(

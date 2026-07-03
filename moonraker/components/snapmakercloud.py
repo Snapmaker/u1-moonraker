@@ -181,6 +181,8 @@ class SnapmakerCloud:
                                     self._on_device_info_update
                                     )
     async def component_init(self) -> None:
+        # Restore persisted print extra info (survives power loss)
+        await self._load_print_extra_info()
         self.mqtt = self.server.lookup_component("mqtt", None)
         if self.mqtt is None:
             logging.info("smcloud: MQTT doesn't exist")
@@ -212,6 +214,7 @@ class SnapmakerCloud:
             file_path: str = web_request.get_str("path")
             options = web_request.get("options", None)
             print_plate = web_request.get_int("print_plate", 1)
+            extra_info = web_request.get("extra_info", None)
 
             if not file_path:
                 return {"state": "error", "message": "path parameter is required"}
@@ -220,7 +223,12 @@ class SnapmakerCloud:
                 return {"state": "error", "message": "options must be a dictionary"}
 
             logging.info(f"start_local_print: path={file_path}, "
-                        f"options={options}, print_plate={print_plate}")
+                        f"options={options}, print_plate={print_plate}, "
+                        f"extra_info={extra_info}")
+
+            self.cache.extra_info = extra_info or {}
+            if self.cache.extra_info:
+                await self._save_print_extra_info()
 
             return await self.print_handler.process_local_file(
                 file_path=file_path,
@@ -241,17 +249,20 @@ class SnapmakerCloud:
             filetype = web_request.get_str("type", None)
             # default file size: 500MB
             filesize = web_request.get_int("size", 0x1F400000)
-            free_space, total_space = self.fm.get_user_space()
             print_plate = web_request.get_int("print_plate", 1)
             options = web_request.get("options", None)
+            extra_info = web_request.get("extra_info", None)
+            free_space, total_space = self.fm.get_user_space()
             logging.info(f"free_space: {free_space}, total_space: {total_space}")
             if free_space <= 0 or filesize > free_space:
                 logging.error(f"not enough space for file {filesize} > {free_space}")
                 return {'state': 'error', 'message': 'not enough space for file'}
 
             logging.info(f"start:{auto_start}, checksum: {checksum}, "
-                            f"type: {filetype}, size: {filesize}, print_plate: {print_plate}, options: {options}")
-            return await self.print_handler.download_file(url, auto_start, checksum, filetype, print_plate, options)
+                            f"type: {filetype}, size: {filesize}, print_plate: {print_plate}, options: {options}, "
+                            f"extra_info: {extra_info}")
+            return await self.print_handler.download_file(
+                url, auto_start, checksum, filetype, print_plate, options, extra_info)
         except Exception as e:
             logging.error(f"{e}")
             return {
@@ -640,8 +651,21 @@ class SnapmakerCloud:
             "filename": new_stats.get("filename", ""),
             "timestamp": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
         }
+        # Include extra_info from cloud print if present
+        if self.cache.extra_info:
+            history = self.server.lookup_component("history")
+            job_id = history.current_job_id
+            notification["extra_info"] = {
+                **self.cache.extra_info,
+                "dev_user_id": self._get_cloud_userid(),
+                "dev_print_task_id": str(job_id) if job_id is not None else "",
+                "dev_actual_print_duration": new_stats.get("print_duration", 0)
+            }
         logging.info(f"state: {state}, job notification: {notification}")
         self.mqtt.publish_notification("notify_device_state_changed", notification)
+        # Clear persisted extra_info on terminal states
+        if state in ("complete", "cancelled", "error", "shutdown"):
+            self._clear_print_extra_info()
 
     def close(self) -> None:
         logging.info("snapmaker cloud exited")
@@ -720,6 +744,40 @@ class SnapmakerCloud:
             await asyncio.sleep(1)
         logging.error("Max retries reached, failed to update device status")
 
+    def _get_cloud_userid(self) -> str:
+        client_mgr = self.server.lookup_component("client_manager", None)
+        if client_mgr is not None:
+            return client_mgr.get_userid()
+        return ""
+
+    async def _save_print_extra_info(self) -> None:
+        if not self.cache.extra_info:
+            return
+        try:
+            db = self.server.lookup_component("database")
+            await db.insert_item("snapmaker_cloud", "print_extra_info", self.cache.extra_info)
+        except Exception as e:
+            logging.error(f"Failed to save print extra to database: {e}")
+
+    async def _load_print_extra_info(self) -> None:
+        try:
+            db = self.server.lookup_component("database")
+            data = await db.get_item("snapmaker_cloud", "print_extra_info", None)
+            if data:
+                self.cache.extra_info = data
+                logging.info(f"Loaded print extra from database")
+        except Exception as e:
+            logging.error(f"Failed to load print extra from database: {e}")
+
+    def _clear_print_extra_info(self) -> None:
+        self.cache.extra_info = {}
+        try:
+            db = self.server.lookup_component("database")
+            fut = db.delete_item("snapmaker_cloud", "print_extra_info")
+            fut.add_done_callback(lambda f: f.exception())  # consume error (key may not exist)
+        except Exception as e:
+            logging.error(f"Failed to clear print extra from database: {e}")
+
 class ReportCache:
     def __init__(self) -> None:
         self.state = "offline"
@@ -733,6 +791,7 @@ class ReportCache:
         self.file_type: str = ""
         self.file_checksum: str = ""
         self.configs: List[str] = []
+        self.extra_info: Dict[str, Any] = {}
 
     def is_printing(self) -> bool:
         return self.state == "printing" or self.state == "paused"
@@ -816,7 +875,8 @@ class PrintHandler:
     async def download_file(self, url: str, start: bool,
                             checksum: str, filetype: str,
                             print_plate: int,
-                            options: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+                            options: Optional[Dict[str, Any]] = None,
+                            extra_info: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         url_path = urlparse(url)
         target_file = pathlib.Path(unquote(url_path.path))
         fm: FileManager = self.server.lookup_component("file_manager")
@@ -851,6 +911,11 @@ class PrintHandler:
             self.download_file_name = target_file.name
             self.auto_start = start
             self.download_time = 0
+        # Store extra_info from cloud print request, clear on absent to
+        # prevent stale data leaking into the next print's notification.
+        self.cache.extra_info = extra_info or {}
+        if self.cache.extra_info:
+            await self.snapmakercloud._save_print_extra_info()
         if options is None:
             coro = self._download_sm_file(url, start, checksum, filetype, print_plate)
         else:
@@ -866,7 +931,7 @@ class PrintHandler:
         print_plate: int,
         gc_path: pathlib.Path,
         target_file: pathlib.Path
-    ) -> Optional[str]:
+    ) -> Optional[pathlib.Path]:
         state = "ready"
         message = ""
         tmp_path = ""
@@ -960,23 +1025,27 @@ class PrintHandler:
             gcode_filename = await self._download_and_process_file(url, checksum, filetype, print_plate, gc_path, target_file)
             if gcode_filename is None:
                 logging.error(f"download file failed: {url}")
+                self.snapmakercloud._clear_print_extra_info()
                 return None
 
             if not gcode_filename.exists():
                 logging.error(f"downloaded file not found: {gcode_filename}")
                 self._notify_download_state("error", f"Downloaded file not found: {gcode_filename.name}")
+                self.snapmakercloud._clear_print_extra_info()
                 return None
 
-            await self.process_local_file(str(gcode_filename), start, options, print_plate, True)
+            await self.process_local_file(gcode_filename.name, start, options, print_plate, True)
             return None
         except Exception as e:
             self._notify_download_state("error", f"start cloud print failed: {e}")
             logging.error(f"start cloud print failed: {e}")
+            self.snapmakercloud._clear_print_extra_info()
             return None
         finally:
             await self._reset_download_state()
 
     async def cancel(self):
+        self.snapmakercloud._clear_print_extra_info()
         if self.download_task is None:
             return {"state": "error", "message": "we are not pulling any file"}
         elif not self.download_task.done():
@@ -1410,6 +1479,8 @@ class PrintHandler:
             logging.info(f"final state: {state}, message: {message}")
             if os.path.exists(tmp_path):
                 os.remove(tmp_path)  # remove the tmp file after handling gcode
+            if state != "ready":
+                self.snapmakercloud._clear_print_extra_info()
         return
 
     async def _extract_gcode_from_zip(self, zip_path: pathlib.Path, gc_path: pathlib.Path) -> Optional[pathlib.Path]:

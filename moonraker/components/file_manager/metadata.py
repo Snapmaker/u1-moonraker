@@ -39,6 +39,25 @@ UFP_THUMB_PATH = "/Metadata/thumbnail.png"
 logging.basicConfig(stream=sys.stderr, level=logging.INFO)
 logger = logging.getLogger("metadata")
 
+
+def _sync_open(path, mode='w', encoding=None, errors=None):
+    """Open *path* in synchronous I/O mode (O_SYNC)."""
+    flags = os.O_SYNC
+    if 'w' in mode:
+        flags |= os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    elif 'a' in mode:
+        flags |= os.O_WRONLY | os.O_CREAT | os.O_APPEND
+    fd = os.open(path, flags)
+    fd_mode = mode.replace('t', '')
+    kwargs = {}
+    if 'b' not in mode:
+        if encoding is not None:
+            kwargs['encoding'] = encoding
+        if errors is not None:
+            kwargs['errors'] = errors
+    return os.fdopen(fd, fd_mode, **kwargs)
+
+
 # Regex helpers.  These methods take patterns with placeholders
 # to insert the correct regex capture group for floats, ints,
 # and strings:
@@ -282,7 +301,7 @@ class BaseSlicer(object):
                 rel_path_from_root = os.path.relpath(file_dir, root_dir)
                 rel_thumb_path = os.path.join(".thumbs", rel_path_from_root, thumb_name)
 
-            with open(thumb_path, "wb") as f:
+            with _sync_open(thumb_path, "wb") as f:
                 f.write(base64.b64decode(data.encode()))
             parsed_matches.append({
                 'width': info[0], 'height': info[1],

@@ -14,7 +14,7 @@ import threading
 import copy
 import logging
 from io import StringIO
-from .utils import Sentinel
+from .utils import Sentinel, open_sync_file, write_text_sync
 from .common import RenderableTemplate
 
 # Annotation imports
@@ -543,7 +543,7 @@ class ConfigHelper:
                 if backup_mtime >= cfg_mtime:
                     # Backup already exists and is current
                     return
-            backup_fp = backup.open("w")
+            backup_fp = open_sync_file(backup, "w")
             self.config.write(backup_fp)
             logging.info(f"Backing up last working configuration to '{backup}'")
         except Exception:
@@ -840,9 +840,9 @@ class FileSourceWrapper(ConfigSourceWrapper):
                 return False
             for idx in self.updates_pending:
                 fpath = self.files[idx]
-                fpath.write_text(
-                    self.raw_config_data[idx], encoding="utf-8"
-                )
+                write_text_sync(fpath,
+                                self.raw_config_data[idx],
+                                encoding="utf-8")
             self.updates_pending.clear()
             return True
 
@@ -907,7 +907,7 @@ class FileSourceWrapper(ConfigSourceWrapper):
                         f"{path.parent.name}-{path.name}"
                     )
                 os.makedirs(str(dest_file.parent), exist_ok=True)
-                dest_file.write_text(self.raw_config_data[i])
+                write_text_sync(dest_file, self.raw_config_data[i])
 
     def _find_section_info(
         self, section: str, file_data: List[str], raise_error: bool = True

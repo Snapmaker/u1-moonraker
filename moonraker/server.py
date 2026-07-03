@@ -27,7 +27,8 @@ from .utils import (
     get_software_info,
     json_wrapper,
     pip_utils,
-    source_info
+    source_info,
+    write_text_sync
 )
 from .loghelper import LogManager
 from .common import RequestType
@@ -673,9 +674,27 @@ def main(from_package: bool = True) -> None:
         default=get_env_bool("MOONRAKER_ASYNCIO_DEBUG"),
         help="Enable asyncio debug flag"
     )
+    parser.add_argument(
+        "-t", "--tmpdir",
+        default=os.getenv("MOONRAKER_TMP_DIR", "/userdata/.tmp"),
+        metavar='<tmpdir>',
+        help="Path to temporary directory (replaces TMPDIR)"
+    )
     cmd_line_args = parser.parse_args()
 
     startup_warnings: List[str] = []
+
+    # setup temporary directory
+    tmp_dir_path = pathlib.Path(cmd_line_args.tmpdir).expanduser().resolve()
+    if not tmp_dir_path.exists():
+        try:
+            tmp_dir_path.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            startup_warnings.append(
+                f"Unable to create tmp directory at {tmp_dir_path}"
+            )
+    os.environ['TMPDIR'] = str(tmp_dir_path)
+
     dp: str = cmd_line_args.datapath or "~/printer_data"
     data_path = pathlib.Path(dp).expanduser().resolve()
     if not data_path.exists():
@@ -688,7 +707,7 @@ def main(from_package: bool = True) -> None:
     uuid_path = data_path.joinpath(".moonraker.uuid")
     if not uuid_path.is_file():
         instance_uuid = uuid.uuid4().hex
-        uuid_path.write_text(instance_uuid)
+        write_text_sync(uuid_path, instance_uuid)
     else:
         instance_uuid = uuid_path.read_text().strip()
     if cmd_line_args.configfile is not None:
@@ -717,7 +736,8 @@ def main(from_package: bool = True) -> None:
         "is_backup_config": False,
         "is_python_package": from_package,
         "instance_uuid": instance_uuid,
-        "unix_socket_path": unix_sock
+        "unix_socket_path": unix_sock,
+        "tmp_dir": str(tmp_dir_path)
     }
 
     fluidd_config_writable = pathlib.Path(data_path).joinpath(FLUIDD_FLAG)
