@@ -588,6 +588,7 @@ class ClientManager:
         cmd = [
             sys.executable,
             self.ca_tool,
+            'generate',
             str(self.certs_dir),
             self.CA_BEGIN_DATE,
             self.CA_AVAILABLE_DAYS,
