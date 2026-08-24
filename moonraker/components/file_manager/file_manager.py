@@ -197,10 +197,10 @@ class FileManager:
                 self.gcode_metadata.prune_storage()
 
     async def component_init(self):
-        # if .factory_reset in gcode root exists, remove directory .thumbs in gcode root
         gcodes_path = self.file_paths.get("gcodes")
         if gcodes_path:
             gcodes_path = pathlib.Path(gcodes_path)
+            # if .factory_reset in gcode root exists, remove directory .thumbs in gcode root
             fact_reset_flag = gcodes_path / FACTORY_RESET_FLAG
             if fact_reset_flag.exists():
                 logging.info("Factory Reset detected, extracting built-in gcodes")
@@ -219,6 +219,12 @@ class FileManager:
                                 shutil.copy2(item, dest)
                 # remove the .factory_reset
                 fact_reset_flag.unlink()
+
+            # Register .udisk path before initializing observer to prevent
+            # recursive inotify watch on potentially huge USB directory trees
+            udisk_path = os.path.join(str(gcodes_path), USB_GCODE_DIR)
+            if os.path.exists(udisk_path):
+                self.usb_mount_paths.add(udisk_path)
 
         self.fs_observer.initialize()
         # Start monitoring USB mount points
@@ -1287,11 +1293,6 @@ class FileManager:
         if not gcodes_path:
             return
 
-        # Check for .udisk directory
-        udisk_path = os.path.join(gcodes_path, USB_GCODE_DIR)
-        if os.path.exists(udisk_path):
-            self.usb_mount_paths.add(udisk_path)
-
         # Schedule periodic checks for mount changes
         self.event_loop.register_callback(self._check_usb_mounts)
 
@@ -1850,6 +1851,8 @@ class InotifyNode:
             if os.path.isdir(item_path):
                 fm = self.iobsvr.file_manager
                 if fm.check_reserved_path(item_path, True, False):
+                    continue
+                if fm.should_skip_watch(item_path):
                     continue
                 new_child = self.create_child_node(fname, False)
                 if new_child is not None:

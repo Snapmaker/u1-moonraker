@@ -291,7 +291,11 @@ class KlippyAPI(APITransport):
         metadata_fields = [
             'line_width', 'layer_height', 'outer_wall_speed', 'nozzle_diameter_list',
             'nozzle_temp', 'filament_type', 'filament_flow_ratio', 'filament_diameter',
-            'filament_max_vol_speed', 'filament_used_g', 'filament_used_mm'
+            'filament_max_volumetric_speed', 'filament_used_g', 'filament_used_mm',
+            'outer_wall_acceleration', 'filament_volume_type', 'print_sequence',
+            'outer_wall_speed_list', 'outer_wall_acceleration_list',
+            'process_flow_support',
+            'slicer', 'slicer_version',
         ]
         new_script_parts = []
         for field in metadata_fields:

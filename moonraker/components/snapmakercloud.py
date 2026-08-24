@@ -53,11 +53,6 @@ import base64
 COMPONENT_VERSION = "0.0.1"
 
 class SnapmakerCloud:
-    DEVICE_STA_OFFLINE  = 0
-    DEVICE_STA_IDLE     = 1
-    DEVICE_STA_PRINTING = 2
-    DEVICE_STA_ERROR    = 3
-
     MAIN_STATE_PRINTING = 1
     # ACTION CODE
     AC_PRINT_PAUSED = 129
@@ -199,7 +194,7 @@ class SnapmakerCloud:
 
     async def _on_device_info_update(self, info: Dict[str, Any]) -> None:
         if 'device_name' in info:
-            await self.update_device_status(-1, info['device_name'])
+            await self.update_device_status(info['device_name'])
     async def _handle_get_status(self,
                                    web_request: WebRequest
                                    ) -> Dict[str, Any]:
@@ -470,17 +465,12 @@ class SnapmakerCloud:
         last_stats: Dict[str, Any] = self.job_state.get_last_stats()
         if last_stats["state"] == "printing":
             self._on_print_started(last_stats, last_stats, False)
-            await self.update_device_status(self.DEVICE_STA_PRINTING)
         else:
             self._update_state("operational")
-            await self.update_device_status(self.DEVICE_STA_IDLE)
 
     async def _on_klippy_startup(self, state: KlippyState) -> None:
         if state != KlippyState.READY:
             self._update_state("error")
-            await self.update_device_status(self.DEVICE_STA_ERROR)
-        else:
-            await self.update_device_status(self.DEVICE_STA_IDLE)
 
     async def _on_klippy_shutdown(self) -> None:
         try:
@@ -501,14 +491,12 @@ class SnapmakerCloud:
         except Exception as e:
             logging.exception(f"Failed to send_job_event {e}")
         self._update_state("error")
-        await self.update_device_status(self.DEVICE_STA_ERROR)
 
     async def _on_klippy_disconnected(self) -> None:
         self._update_state("offline")
         # self.send_sp("connection", {"new": "disconnected"})
         self.cache.reset_print_state()
         self.printer_status = {}
-        await self.update_device_status(self.DEVICE_STA_ERROR)
 
     def _on_job_state_changed(self, job_event: JobEvent, *args) -> None:
         callback: Optional[Callable] = getattr(self, f"_on_print_{job_event}", None)
@@ -687,20 +675,20 @@ class SnapmakerCloud:
             "units": "MiB"
         }
 
-    async def update_device_status(self, status: int = -1, device_name=None) -> None:
+    async def update_device_status(self, device_name=None) -> None:
         if self.mqtt is None:
-            logging.warning("MQTT client not initialized, cannot update device status")
+            logging.warning("MQTT client not initialized, cannot update device name")
             return
         if device_name is None:
             machine: Machine = self.server.lookup_component("machine", None)
             device_name = machine.get_device_name()
-        logging.info(f"Updating device status {status}, name: {device_name}")
+        logging.info(f"Updating device name: {device_name}")
         retry: int = 3
         jrpc_id = random.randint(0, 0x7fffffff)
         while retry > 0:
             retry -= 1
             try:
-                # publish the device status to the MQTT agent
+                # publish the device name update request to the MQTT agent
                 req_msg = {
                     'jsonrpc': "2.0",
                     'method': 'mqtt_agent.update_device_status',
@@ -709,8 +697,6 @@ class SnapmakerCloud:
                         'name': device_name
                     }
                 }
-                if status >= 0:
-                    req_msg['params']['online'] = status
                 resp = await self.mqtt.publish_topic_with_response(
                         "mqtt_agent/request/moonraker",
                         "mqtt_agent/response/moonraker",
@@ -728,21 +714,21 @@ class SnapmakerCloud:
                     continue
 
                 if obj.get('id', 0) != jrpc_id:
-                    logging.error(f"dev sta: Invalid jrpc id in response: {obj}")
+                    logging.error(f"dev name: Invalid jrpc id in response: {obj}")
                     await asyncio.sleep(1)
                     continue
 
                 params = obj['result']
-                if not isinstance(params, dict) and params.get('state', 'error') != 'success':
+                if not isinstance(params, dict) or params.get('state', 'error') != 'success':
                     # sleep 1s and retry
-                    logging.error(f"dev sta: return state: {params}")
+                    logging.error(f"dev name: return state: {params}")
                     await asyncio.sleep(1)
                     continue
                 return
             except Exception as e:
-                logging.error(f"Failed to update device status: {e}")
+                logging.error(f"Failed to update device name: {e}")
             await asyncio.sleep(1)
-        logging.error("Max retries reached, failed to update device status")
+        logging.error("Max retries reached, failed to update device name")
 
     def _get_cloud_userid(self) -> str:
         client_mgr = self.server.lookup_component("client_manager", None)
@@ -1202,24 +1188,15 @@ class PrintHandler:
                     logging.error("Invalid content type in 3mf file")
                     return None
 
-                # project_settings.config is a json file, check if it contain field 'print_compatible_printers'
-                # and 'print_compatible_printers' is a list, and if there is one element in print_compatible_printers contains string 'Snapmaker U1'
+                # project_settings.config is a json file, check if it contain field 'printer_model'
+                # and if printer_model contains string 'Snapmaker U1'
                 if project_settings_path is None:
                     logging.error("project_settings.config not found in 3mf file")
                     return None
                 project_settings = jsonw.loads(zf.read(project_settings_path).decode('utf-8'))
-                print_compatible_u1 = False
-                if 'print_compatible_printers' in project_settings \
-                        and isinstance(project_settings['print_compatible_printers'], list) \
-                        and len(project_settings['print_compatible_printers']) > 0:
-
-                        for printer in project_settings['print_compatible_printers']:
-                            logging.info(f"compatible printer: {printer}")
-                            if 'Snapmaker U1' in printer:
-                                print_compatible_u1 = True
-
-                if not print_compatible_u1:
-                    logging.error("Invalid project settings in 3mf file")
+                printer_model = project_settings.get('printer_model', '')
+                if 'Snapmaker U1' not in printer_model:
+                    logging.error(f"Invalid printer model in 3mf file: {printer_model}")
                     return None
 
                 if len(plates) == 0:

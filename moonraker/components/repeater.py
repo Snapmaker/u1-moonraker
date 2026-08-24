@@ -55,58 +55,44 @@ class Repeater:
         self.mqtt: MQTTClient = None
 
         self.camera_req_topic = "camera/request"
+        self.camera_resp_topic = "camera/response"
         self.system_req_topic = "system/request"
+        self.system_resp_topic = "system/response"
 
-        self.server.register_endpoint(
-            "/camera/get_timelapse_instance", RequestType.POST, self._handle_camera_timelapse_request,
-            transports=(TransportType.all() & ~TransportType.HTTP)
-        )
-
-        self.server.register_endpoint(
-            "/camera/delete_timelapse_instance", RequestType.POST, self._handle_camera_timelapse_request,
-            transports=(TransportType.all() & ~TransportType.HTTP)
-        )
-
-        self.server.register_endpoint(
-            "/camera/upload_timelapse_instance", RequestType.POST, self._handle_camera_timelapse_request,
-            transports=(TransportType.all() & ~TransportType.HTTP)
-        )
-
-        self.server.register_endpoint("/camera/start_monitor", RequestType.POST,
-            self._handle_camera_timelapse_request,
-            transports=(TransportType.all() & ~TransportType.HTTP)
+        # Register all camera endpoints (proxied to unisrv via MQTT)
+        camera_endpoints = [
+            "/camera/start_monitor",
+            "/camera/stop_monitor",
+            # "/camera/take_a_photo",
+            # "/camera/start_timelapse",
+            # "/camera/stop_timelapse",
+            "/camera/get_timelapse_instance",
+            "/camera/delete_timelapse_instance",
+            # "/camera/upload_timelapse_instance",
+            # "/camera/get_status",
+            # "/camera/detect_capture",
+        ]
+        for ep in camera_endpoints:
+            self.server.register_endpoint(
+                ep, RequestType.POST,
+                self._handle_camera_request,
+                transports=(TransportType.all() & ~TransportType.HTTP)
             )
 
-        self.server.register_endpoint("/camera/stop_monitor",
-            RequestType.POST,
-            self._handle_camera_timelapse_request,
-            transports=(TransportType.all() & ~TransportType.HTTP)
+        # Register all system endpoints (proxied to unisrv via MQTT)
+        system_endpoints = [
+            "/system/get_device_info",
+            # "/system/collect_sysinfo",
+            "/system/upgrade",
+            "/system/upgrade_check_remote",
+            "/system/upgrade_download_firmware",
+        ]
+        for ep in system_endpoints:
+            self.server.register_endpoint(
+                ep, RequestType.POST,
+                self._handle_system_request,
+                transports=(TransportType.all() & ~TransportType.HTTP)
             )
-
-        self.server.register_endpoint(
-            "/system/get_device_info", RequestType.POST, self._handle_system_service_request,
-            transports=(TransportType.all() & ~TransportType.HTTP)
-        )
-
-        self.server.register_endpoint(
-            "/system/collect_sysinfo", RequestType.POST, self._handle_system_service_request,
-            transports=(TransportType.all() & ~TransportType.HTTP)
-        )
-
-        self.server.register_endpoint(
-            "/system/upgrade", RequestType.POST, self._handle_system_service_request,
-            transports=(TransportType.all() & ~TransportType.HTTP)
-        )
-
-        self.server.register_endpoint(
-            "/system/upgrade_check_remote", RequestType.POST, self._handle_system_service_request,
-            transports=(TransportType.all() & ~TransportType.HTTP)
-        )
-
-        self.server.register_endpoint(
-            "/system/upgrade_download_firmware", RequestType.POST, self._handle_system_service_request,
-            transports=(TransportType.all() & ~TransportType.HTTP)
-        )
 
     async def component_init(self) -> None:
         self.mqtt = self.server.lookup_component("mqtt", None)
@@ -114,66 +100,63 @@ class Repeater:
             logging.info("smcloud: MQTT doesn't exist")
             return
 
+        # Subscribe to camera/system MQTT responses and forward to cloud
         self.mqtt_camera_resp = self.mqtt.subscribe_topic(
-                                    "camera/response",
-                                    self._handle_internal_service_response,
+                                    self.camera_resp_topic,
+                                    self._forward_to_cloud,
                                     qos=1)
         self.mqtt_system_resp = self.mqtt.subscribe_topic(
-                                    "system/response",
-                                    self._handle_internal_service_response,
+                                    self.system_resp_topic,
+                                    self._forward_to_cloud,
                                     qos=1)
-    async def _handle_internal_service_response(self,
-                                    data: bytes
-                                    ) -> None:
-        """
-        Handle the response from camera/system.
-        """
-        self.mqtt.publish_topic(self.mqtt.api_resp_topic, data, self.mqtt.api_qos)
 
-    async def _handle_camera_timelapse_request(self,
-                                web_request: WebRequest
+    async def _forward_to_cloud(self, data: bytes) -> None:
+        await self.mqtt.publish_topic(self.mqtt.api_resp_topic, data, self.mqtt.api_qos)
+
+    async def _handle_camera_request(self, web_request: WebRequest) -> Any:
+        return await self._handle_internal_request(
+            web_request, self.camera_req_topic, self.camera_resp_topic)
+
+    async def _handle_system_request(self, web_request: WebRequest) -> Any:
+        return await self._handle_internal_request(
+            web_request, self.system_req_topic, self.system_resp_topic)
+
+    async def _handle_internal_request(self,
+                                web_request: WebRequest,
+                                req_topic: str,
+                                resp_topic: str
                                 ) -> Any:
-        """
-        Handle the request to get the timelapse instance.
-        """
         req_id = web_request.get_int("req_id", None)
         if req_id is None:
             logging.error(f"{web_request.get_endpoint()}: req_id is required")
         endpoint = web_request.get_endpoint()
         # Remove leading '/' and replace '/' with '.'
-        endpoint = endpoint[1:].replace('/', '.')
+        method = endpoint[1:].replace('/', '.')
         mesg = {
             "jsonrpc": "2.0",
-            "method": endpoint,
+            "method": method,
             "params": web_request.get_args(),
             "id": req_id
         }
-        logging.info(f"{web_request.get_endpoint()}: {req_id}")
-        self.mqtt.publish_topic(self.camera_req_topic, jsonw.dumps(mesg), self.mqtt.api_qos)
-        return None
-
-    async def _handle_system_service_request(self,
-                                web_request: WebRequest
-                                ) -> Any:
-        """
-        Handle the request to collect system information.
-        """
-        req_id = web_request.get_int("req_id", None)
-        if req_id is None:
-            logging.error(f"{web_request.get_endpoint()}: req_id is required")
-        endpoint = web_request.get_endpoint()
-        # Remove leading '/' and replace '/' with '.'
-        endpoint = endpoint[1:].replace('/', '.')
-        mesg = {
-            "jsonrpc": "2.0",
-            "method": endpoint,
-            "params": web_request.get_args(),
-            "id": req_id
-        }
-        logging.debug(f"{web_request.get_endpoint()}: {web_request.get_args()}")
-        self.mqtt.publish_topic(self.system_req_topic, jsonw.dumps(mesg), self.mqtt.api_qos)
-        return None
+        logging.info(f"Repeater {method}: req_id={req_id}")
+        try:
+            resp_bytes = await self.mqtt.publish_topic_with_response(
+                req_topic, resp_topic,
+                jsonw.dumps(mesg), self.mqtt.api_qos,
+                timeout=10)
+            resp = jsonw.loads(resp_bytes)
+            if "error" in resp:
+                err = resp["error"]
+                raise self.server.error(
+                    err.get("message", "Internal MQTT error"),
+                    err.get("code", 500)
+                )
+            return resp.get("result", {})
+        except self.server.error:
+            raise
+        except Exception as e:
+            logging.error(f"Repeater {method}: error={e}")
+            return {"state": "failed", "message": str(e)}
 
 def load_component(config: ConfigHelper) -> Repeater:
     return Repeater(config)
-

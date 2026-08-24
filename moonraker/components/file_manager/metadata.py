@@ -358,6 +358,9 @@ class BaseSlicer(object):
     def parse_outer_wall_speed(self) -> Optional[float]:
         return None
 
+    def parse_outer_wall_acceleration(self) -> Optional[float]:
+        return None
+
     def parse_filament_diameter(self) -> Optional[List[float]]:
         return None
 
@@ -480,6 +483,21 @@ class PrusaSlicer(BaseSlicer):
     def parse_filament_type(self) -> Optional[str]:
         return regex_find_string(r";\sfilament_type\s=\s(%S)", self.footer_data)
 
+    def parse_filament_volume_type(self) -> Optional[str]:
+        result = regex_find_string(r";\sfilament_volume_type\s=\s(%S)", self.footer_data)
+        if result:
+            return [s.strip() for s in result.split(",")]
+        return None
+
+    def parse_process_flow_support(self) -> Optional[List[str]]:
+        result = regex_find_string(r";\sprocess_flow_support\s=\s(%S)", self.footer_data)
+        if result:
+            return [s.strip() for s in result.split(",")]
+        return None
+
+    def parse_print_sequence(self) -> Optional[str]:
+        return regex_find_string(r";\sprint_sequence\s=\s(%S)", self.footer_data)
+
     def parse_filament_retract_length_toolchange(self) -> Optional[List[float]]:
         # Use (.*)$ to capture empty values as well
         line = regex_find_string(
@@ -550,6 +568,26 @@ class PrusaSlicer(BaseSlicer):
 
     def parse_outer_wall_speed(self) -> Optional[float]:
         return regex_find_float(r";\souter_wall_speed\s=\s(%F)", self.footer_data)
+
+    def parse_outer_wall_speed_list(self) -> Optional[List[float]]:
+        line = regex_find_string(r'outer_wall_speed\s=\s(%S)\n', self.footer_data)
+        if line:
+            outer_wall_speed_list = regex_find_floats(r"(%F)", line)
+            if outer_wall_speed_list:
+                return outer_wall_speed_list
+        return None
+
+    def parse_outer_wall_acceleration(self):
+        return regex_find_float(r";\souter_wall_acceleration\s=\s(%F)", self.footer_data)
+
+    def parse_outer_wall_acceleration_list(self) -> Optional[List[float]]:
+        line = regex_find_string(r'outer_wall_acceleration\s=\s(%S)\n', self.footer_data)
+        if line:
+            outer_wall_acceleration_list = regex_find_floats(r"(%F)", line)
+            if outer_wall_acceleration_list:
+                return outer_wall_acceleration_list
+        return None
+
 
     def parse_filament_diameter(self) -> Optional[List[float]]:
         line = regex_find_string(r'filament_diameter\s=\s(%S)\n', self.footer_data)
@@ -1149,12 +1187,18 @@ SUPPORTED_DATA = [
     'filament_retract_length_toolchange',
     'line_width',
     'outer_wall_speed',
+    'outer_wall_acceleration',
+    'outer_wall_speed_list',
+    'outer_wall_acceleration_list',
     'filament_diameter',
     'filament_used_mm',
     'filament_max_volumetric_speed',
     'filament_flow_ratio',
     'nozzle_temp',
     'nozzle_diameter_list',
+    'filament_volume_type',
+    'process_flow_support',
+    'print_sequence',
     'thumbnails']
 
 def process_objects(file_path: str, slicer: BaseSlicer, name: str) -> bool:
