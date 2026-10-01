@@ -304,11 +304,12 @@ class KlippyAPI(APITransport):
             elif field == 'filament_type':
                 value = metadata.get(field, None)
                 if value is not None:
-                    value = [f'{item}' if item else 'NONE' for item in value.split(';')]
+                    value = [item.strip("'\"") if item else 'NONE' for item in value.split(';')]
             else:
                 value = metadata.get(field, None)
             if value is not None:
-                new_script_parts.append(f' {field.upper()}="{value}"')
+                val_str = str(value).replace('"', "'")
+                new_script_parts.append(f' {field.upper()}="{val_str}"')
         if new_script_parts:
             new_script = ''.join(new_script_parts)
             script += new_script
