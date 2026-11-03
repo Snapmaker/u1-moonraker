@@ -55,7 +55,9 @@ COMPONENT_VERSION = "0.0.1"
 class SnapmakerCloud:
     MAIN_STATE_PRINTING = 1
     # ACTION CODE
+    AC_PRINT_IDLE = 0  # klipper ActionCode.IDLE, used for the "print started" event
     AC_PRINT_PAUSED = 129
+    AC_PRINT_RESUMING = 130  # klipper ActionCode.PRINT_RESUMING
     AC_PRINT_EXCEPTION_PAUSED = 137
     AC_PRINT_EXCEPTION_CANCELED = 138
     AC_PRINT_CANCELED = 139
@@ -183,6 +185,7 @@ class SnapmakerCloud:
             logging.info("smcloud: MQTT doesn't exist")
             return
         self.mqtt.register_notification("smcloud:file_pull_progress")
+        self.mqtt.register_notification("smcloud:devie_info_update", "device_info_update")
         self.mqtt.register_notification("file_manager:filelist_changed")
         self.mqtt.register_notification("job_queue:job_queue_changed")
         self.mqtt.register_notification("history:history_changed")
@@ -225,11 +228,14 @@ class SnapmakerCloud:
             if self.cache.extra_info:
                 await self._save_print_extra_info()
 
-            return await self.print_handler.process_local_file(
+            result = await self.print_handler.process_local_file(
                 file_path=file_path,
                 options=options,
                 print_plate=print_plate
             )
+            if result.get("state") != "success":
+                self._clear_print_extra_info()
+            return result
         except Exception as e:
             logging.exception(f"start_local_print error: {e}")
             return {"state": "error", "message": f"Exception: {e}"}
@@ -513,6 +519,8 @@ class SnapmakerCloud:
     ) -> None:
         # inlcludes started and resumed events
         self._update_state("printing")
+        if need_start_event:
+            self._send_job_event('started', prev_stats, new_stats)
         filename = new_stats["filename"]
         job_info: Dict[str, Any] = {"filename": filename}
         metadata = self.fm.get_file_metadata(filename)
@@ -614,8 +622,12 @@ class SnapmakerCloud:
         else:
             if id is None or index is None or \
                 level is None or code is None:
-                if state == "paused":
+                if state == "started":
+                    job_state = ''.join([main_state, '-', str(self.AC_PRINT_IDLE), normal_code])
+                elif state == "paused":
                     job_state = ''.join([main_state, '-', str(self.AC_PRINT_PAUSED), normal_code])
+                elif state == "resumed":
+                    job_state = ''.join([main_state, '-', str(self.AC_PRINT_RESUMING), normal_code])
                 elif state == "cancelled":
                     job_state = ''.join([main_state, '-', str(self.AC_PRINT_CANCELED), normal_code])
                 elif state == "complete":
@@ -831,12 +843,20 @@ class PrintHandler:
             return eventtime + self.CHECK_INTERVAL * 2
         return eventtime + self.CHECK_INTERVAL
 
+    def _attach_print_extra_info(self, event: Dict[str, Any]) -> None:
+        if self.cache.extra_info:
+            event['extra_info'] = {
+                **self.cache.extra_info,
+                "dev_user_id": self.snapmakercloud._get_cloud_userid(),
+            }
+
     def _notify_download_state(self, state: str, message: str = "") -> None:
         event = {'state': state}
         if len(message) > 0:
             event['message'] = message
         event['path'] = self.download_file_name
         event['auto_start'] = self.auto_start
+        self._attach_print_extra_info(event)
         logging.info(f"notify_download_state: {event}")
         self.server.send_event("smcloud:file_pull_progress", event)
 
@@ -1027,7 +1047,9 @@ class PrintHandler:
                 self.snapmakercloud._clear_print_extra_info()
                 return None
 
-            await self.process_local_file(gcode_filename.name, start, options, print_plate, True)
+            result = await self.process_local_file(gcode_filename.name, start, options, print_plate, True)
+            if result.get("state") != "success" or not start:
+                self.snapmakercloud._clear_print_extra_info()
             return None
         except Exception as e:
             self._notify_download_state("error", f"start cloud print failed: {e}")
@@ -1038,13 +1060,14 @@ class PrintHandler:
             await self._reset_download_state()
 
     async def cancel(self):
-        self.snapmakercloud._clear_print_extra_info()
         if self.download_task is None:
+            self.snapmakercloud._clear_print_extra_info()
             return {"state": "error", "message": "we are not pulling any file"}
         elif not self.download_task.done():
             self.download_task.cancel()
             self.download_task = None
             self._notify_download_state("cancel", "user cancel downloading")
+            self.snapmakercloud._clear_print_extra_info()
             await self._reset_download_state()
             return {"state": "success"}
         else:
@@ -1052,6 +1075,7 @@ class PrintHandler:
             self.download_progress = -1
             self.download_time = 0.0
             self._notify_download_state("cancel", "user cancel downloading")
+            self.snapmakercloud._clear_print_extra_info()
             await self._reset_download_state()
             return {"state": "error", "message": "pulling task is exited"}
 
@@ -1469,7 +1493,7 @@ class PrintHandler:
             logging.info(f"final state: {state}, message: {message}")
             if os.path.exists(tmp_path):
                 os.remove(tmp_path)  # remove the tmp file after handling gcode
-            if state != "ready":
+            if state != "ready" or args.get("print") != "true":
                 self.snapmakercloud._clear_print_extra_info()
         return
 
@@ -1744,6 +1768,7 @@ class PrintHandler:
         self.download_progress = percent
         pull_progress = {"state": "downloading", "percent": percent, \
                         "auto_start": self.auto_start, "path": self.download_file_name}
+        self._attach_print_extra_info(pull_progress)
         logging.debug("progress: {}".format(pull_progress))
         self.server.send_event("smcloud:file_pull_progress", pull_progress)
 
