@@ -474,7 +474,7 @@ def _set_cors_headers(req_hdlr: tornado.web.RequestHandler) -> None:
             "Access-Control-Allow-Headers",
             "Origin, Accept, Content-Type, X-Requested-With, "
             "X-CRSF-Token, Authorization, X-Access-Token, "
-            "X-Api-Key, Cache-Control"
+            "X-Api-Key, Cache-Control, X-Request-Id"
         )
         req_pvt_header = req_hdlr.request.headers.get(
             "Access-Control-Request-Private-Network", None
