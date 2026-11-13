@@ -537,8 +537,9 @@ class FileManager:
             relpath: Optional[str] = info.pop("relative_path", None)
             if relpath is None:
                 continue
-            thumbpath = pathlib.Path(".thumbs").joinpath(relpath.split("/", 1)[-1] if "/" in relpath else relpath)
-            info["thumbnail_path"] = str(thumbpath)
+            info["thumbnail_path"] = os.path.normpath(
+                os.path.join(os.path.dirname(requested_file), relpath)
+            )
         return thumblist
 
     async def _handle_directory_request(self,
@@ -1663,7 +1664,7 @@ class BaseFileSystemObserver:
                 prev_rel_path = fm.get_relative_path("gcodes", prev_path)
                 new_rel_path = fm.get_relative_path("gcodes", new_path)
                 if is_dir:
-                    gcm.move_directory_metadata(prev_rel_path, new_rel_path)
+                    return gcm.move_directory_metadata(prev_rel_path, new_rel_path)
                 else:
                     return gcm.move_file_metadata(prev_rel_path, new_rel_path)
             else:
@@ -1933,6 +1934,8 @@ class InotifyNode:
                     if mevts:
                         mfuts = [e.wait() for e in mevts]
                         await asyncio.gather(*mfuts)
+                elif not isinstance(move_res, bool):
+                    await move_res
                 self.iobsvr.notify_filelist_changed(
                     "move_dir", new_root, new_path, prev_root, prev_path
                 )
@@ -2685,6 +2688,21 @@ class MetadataStorage:
         # That said, in the future all components that access metadata should
         # be refactored to do so asynchronously.
         self.metadata: Dict[str, Any] = self.mddb.as_dict()
+        # Older Snapmaker metadata stored centralized thumbnail paths relative
+        # to the gcodes root.  Convert only that layout, preserving the cache.
+        for fname, metadata in self.metadata.items():
+            parent = os.path.dirname(fname)
+            if not parent:
+                continue
+            legacy_prefix = os.path.join(".thumbs", parent) + os.sep
+            changed = False
+            for thumb in metadata.get("thumbnails", []):
+                path = thumb.get("relative_path", "")
+                if path and path.startswith(legacy_prefix):
+                    thumb["relative_path"] = os.path.relpath(path, parent)
+                    changed = True
+            if changed:
+                self.mddb[fname] = metadata
         self.pending_requests: Dict[
             str, Tuple[Dict[str, Any], asyncio.Event]] = {}
         self.busy: bool = False
@@ -2785,12 +2803,6 @@ class MetadataStorage:
             # Delete associated thumbnails
             fdir = os.path.dirname(os.path.join(self.gc_path, fname))
 
-            # Get top-level .thumbs directory
-            root_thumbs_dir = os.path.join(self.gc_path, ".thumbs")
-
-            # Calculate the actual path of thumbnails
-            file_thumb_dir = os.path.join(root_thumbs_dir, os.path.dirname(fname))
-
             if "thumbnails" in metadata:
                 thumb: Dict[str, Any]
                 for thumb in metadata["thumbnails"]:
@@ -2799,7 +2811,7 @@ class MetadataStorage:
                         continue
 
                     # Build the full path of thumbnail
-                    thumb_path = os.path.join(self.gc_path, path)
+                    thumb_path = os.path.normpath(os.path.join(fdir, path))
                     if not os.path.isfile(thumb_path):
                         continue
                     try:
@@ -2807,7 +2819,9 @@ class MetadataStorage:
                     except Exception:
                         logging.debug(f"Error removing thumb at {thumb_path}")
 
-    def move_directory_metadata(self, prev_dir: str, new_dir: str) -> None:
+    def move_directory_metadata(
+        self, prev_dir: str, new_dir: str
+    ) -> Union[bool, Awaitable]:
         if prev_dir[-1] != "/":
             prev_dir += "/"
         moved: List[Tuple[str, str, Dict[str, Any]]] = []
@@ -2824,8 +2838,9 @@ class MetadataStorage:
             source = [m[0] for m in moved]
             dest = [m[1] for m in moved]
             self.mddb.move_batch(source, dest)
-            # It shouldn't be necessary to move the thumbnails
-            # as they would be moved with the parent directory
+            # Centralized thumbnails do not move with the G-code directory.
+            return self._move_thumbnails(moved)
+        return True
 
     def move_file_metadata(
         self, prev_fname: str, new_fname: str
@@ -2851,7 +2866,8 @@ class MetadataStorage:
         for (prev_fname, new_fname, metadata) in records:
             # Calculate source and destination thumbnail paths
             root_thumbs_dir = os.path.join(self.gc_path, ".thumbs")
-            prev_thumb_dir = os.path.join(root_thumbs_dir, os.path.dirname(prev_fname))
+            prev_dir = os.path.dirname(os.path.join(self.gc_path, prev_fname))
+            new_dir = os.path.dirname(os.path.join(self.gc_path, new_fname))
             new_thumb_dir = os.path.join(root_thumbs_dir, os.path.dirname(new_fname))
 
             if "thumbnails" in metadata:
@@ -2862,21 +2878,18 @@ class MetadataStorage:
                         continue
 
                     # Build source and destination thumbnail paths
-                    thumb_path = os.path.join(self.gc_path, path)
+                    thumb_path = os.path.normpath(os.path.join(prev_dir, path))
                     if not os.path.isfile(thumb_path):
                         continue
 
                     # Calculate new thumbnail path
                     thumb_name = os.path.basename(path)
-                    if os.path.dirname(new_fname) == "":
-                        new_path = os.path.join(root_thumbs_dir, thumb_name)
-                    else:
-                        new_path = os.path.join(root_thumbs_dir, os.path.dirname(new_fname), thumb_name)
+                    new_path = os.path.join(new_thumb_dir, thumb_name)
 
                     new_parent = os.path.dirname(new_path)
                     try:
                         if not os.path.exists(new_parent):
-                            os.makedirs(new_parent)
+                            os.makedirs(new_parent, exist_ok=True)
                         await eventloop.run_in_thread(
                             shutil.move, thumb_path, new_path
                         )
@@ -2886,25 +2899,9 @@ class MetadataStorage:
                         logging.exception(
                             f"Error moving thumb from {thumb_path} to {new_path}"
                         )
-
-                    if not os.path.isfile(thumb_path):
                         continue
-                    new_path = os.path.join(new_dir, path)
-                    new_parent = os.path.dirname(new_path)
-                    try:
-                        if not os.path.exists(new_parent):
-                            os.mkdir(new_parent)
-                            # Wait for inotify to register the node before the move
-                            await asyncio.sleep(.2)
-                        await eventloop.run_in_thread(
-                            shutil.move, thumb_path, new_path
-                        )
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception:
-                        logging.exception(
-                            f"Error moving thumb from {thumb_path} to {new_path}"
-                        )
+                    thumb["relative_path"] = os.path.relpath(new_path, new_dir)
+                self.mddb[new_fname] = metadata
 
     def parse_metadata(self,
                        fname: str,

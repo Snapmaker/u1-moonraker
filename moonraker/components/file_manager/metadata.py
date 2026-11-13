@@ -301,11 +301,7 @@ class BaseSlicer(object):
             thumb_path = os.path.join(thumb_dir, thumb_name)
 
             # Calculate the thumbnail path relative to the gcode file's directory
-            if file_dir == root_dir:
-                rel_thumb_path = os.path.join(".thumbs", thumb_name)
-            else:
-                rel_path_from_root = os.path.relpath(file_dir, root_dir)
-                rel_thumb_path = os.path.join(".thumbs", rel_path_from_root, thumb_name)
+            rel_thumb_path = os.path.relpath(thumb_path, file_dir)
 
             with _sync_open(thumb_path, "wb") as f:
                 f.write(base64.b64decode(data.encode()))
@@ -325,15 +321,9 @@ class BaseSlicer(object):
             thumb_full_name = largest_match['relative_path'].split("/")[-1]
             thumb_path = os.path.join(thumb_dir, f"{thumb_full_name}")
 
-            # Calculate the thumbnail path relative to the gcode file's directory
-            if file_dir == root_dir:
-                rel_path_medium = os.path.join(".thumbs", f"{thumb_base}-96x96.png")
-            else:
-                rel_path_from_root = os.path.relpath(file_dir, root_dir)
-                rel_path_medium = os.path.join(".thumbs", rel_path_from_root, f"{thumb_base}-96x96.png")
-
             thumb_path_medium = os.path.join(
                 thumb_dir, f"{thumb_base}-96x96.png")
+            rel_path_medium = os.path.relpath(thumb_path_medium, file_dir)
             # read file
             try:
                 with Image.open(thumb_path) as im:
@@ -778,17 +768,10 @@ class Cura(BaseSlicer):
 
         thumb_base = os.path.splitext(os.path.basename(self.path))[0]
 
-        # Calculate the thumbnail path relative to the gcode file's directory
-        if file_dir == root_dir:
-            rel_path_full = os.path.join(".thumbs", f"{thumb_base}.png")
-            rel_path_medium = os.path.join(".thumbs", f"{thumb_base}-96x96.png")
-        else:
-            rel_path_from_root = os.path.relpath(file_dir, root_dir)
-            rel_path_full = os.path.join(".thumbs", rel_path_from_root, f"{thumb_base}.png")
-            rel_path_medium = os.path.join(".thumbs", rel_path_from_root, f"{thumb_base}-96x96.png")
-
         thumb_path = os.path.join(thumb_dir, f"{thumb_base}.png")
         thumb_path_medium = os.path.join(thumb_dir, f"{thumb_base}-96x96.png")
+        rel_path_full = os.path.relpath(thumb_path, file_dir)
+        rel_path_medium = os.path.relpath(thumb_path_medium, file_dir)
         if not os.path.isfile(thumb_path):
             return None
         # read file
