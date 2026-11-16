@@ -227,6 +227,21 @@ class BaseSlicer(object):
     def parse_filament_type(self) -> Optional[str]:
         return None
 
+    def parse_filament_volume_type(self) -> Optional[str]:
+        return None
+
+    def parse_process_flow_support(self) -> Optional[List[str]]:
+        return None
+
+    def parse_print_sequence(self) -> Optional[str]:
+        return None
+
+    def parse_outer_wall_speed_list(self) -> Optional[List[float]]:
+        return None
+
+    def parse_outer_wall_acceleration_list(self) -> Optional[List[float]]:
+        return None
+
     def parse_estimated_time(self) -> Optional[float]:
         return None
 
