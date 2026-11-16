@@ -498,7 +498,14 @@ class PrusaSlicer(BaseSlicer):
         )
 
     def parse_filament_type(self) -> Optional[str]:
-        return regex_find_string(r";\sfilament_type\s=\s(%S)", self.footer_data)
+        # The slicer quotes only the entries that contain a space, e.g.
+        # "PLA Matte";PLA;PLA.  Unquote each entry and keep the value a
+        # ";" separated string, which is what the firmware consumes.
+        match = re.search(r";\sfilament_type\s=\s(.*)", self.footer_data)
+        if match is None:
+            return None
+        entries = re.findall(r'"(?:\\"|[^"])*"|[^;]+', match.group(1))
+        return ";".join(e.strip().strip('"') for e in entries)
 
     def parse_filament_volume_type(self) -> Optional[str]:
         result = regex_find_string(r";\sfilament_volume_type\s=\s(%S)", self.footer_data)
